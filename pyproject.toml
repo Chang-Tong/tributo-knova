@@ -1,0 +1,40 @@
+[project]
+name = "tributo-knova"
+version = "0.1.0"
+description = "KnoVa integration for Tributo"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "tributo>=1.0,<2.0",
+    "tributo-broker-redis>=0.1,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6,<1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tributo_knova"]
+
+[tool.uv.sources]
+tributo = { path = "../tributo", editable = true }
+"tributo-broker-redis" = { path = "../tributo-broker-redis", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
