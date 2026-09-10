@@ -1,0 +1,48 @@
+{
+  "broker_id": "tributo-knova",
+  "api_version": 1,
+  "transport": {
+    "mode": "standalone",
+    "url": "redis://127.0.0.1:6379/0",
+    "driver_url": "redis://127.0.0.1:6379/0",
+    "block_ms": 1000,
+    "claim_idle_ms": 60000
+  },
+  "channels": {
+    "training": {
+      "task_stream_key": "knova:aimodel:training:distributed:tasks",
+      "event_stream_prefix": "knova:aimodel:training:distributed:events",
+      "cancel_key_prefix": "knova:aimodel:training:distributed:cancel",
+      "consumer_group": "knova-trainers",
+      "consumer_name": "tributo-knova-training",
+      "group_start_id": "0-0",
+      "outer_identity_field": "job_id"
+    },
+    "batch_inference": {
+      "task_stream_key": "knova:aimodel:inference:distributed:tasks",
+      "event_stream_prefix": "knova:aimodel:inference:distributed:events",
+      "cancel_key_prefix": "knova:aimodel:inference:distributed:cancel",
+      "consumer_group": "knova-backend-inference",
+      "consumer_name": "tributo-knova-inference",
+      "group_start_id": "0-0",
+      "outer_identity_field": "execution_id"
+    }
+  },
+  "operations": {
+    "training": {"execution_profiles": ["distributed"]},
+    "batch_inference": {"execution_profiles": ["distributed"]}
+  },
+  "execution": {
+    "ray_dashboard_url": "http://127.0.0.1:8265",
+    "project_root": "/opt/tributo-runtime/core",
+    "extra_py_modules": [
+      "/opt/tributo-runtime/extensions/tributo_knova",
+      "/opt/tributo-runtime/extensions/tributo_broker_redis",
+      "/opt/tributo-runtime/extensions/tributo_algorithms_boosting"
+    ],
+    "env_vars": {
+      "PATH": "/opt/tributo-knova/bin:/usr/local/bin:/usr/bin:/bin"
+    },
+    "entrypoint_num_cpus": 0
+  }
+}
