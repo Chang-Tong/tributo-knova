@@ -57,9 +57,7 @@ def test_validate_uses_knova_plugin_config_validation(
 
     monkeypatch.setattr(cli, "KnovaBrokerPlugin", Plugin)
 
-    result = cli.main(
-        ["validate", "--config", str(path), "--check-connectivity"]
-    )
+    result = cli.main(["validate", "--config", str(path), "--check-connectivity"])
 
     assert result == 0
     assert calls == [(value, True)]
@@ -97,6 +95,33 @@ def test_consume_once_uses_knova_runtime_and_installs_shutdown_handlers(
 
     handlers[signal.SIGTERM](signal.SIGTERM, None)
     assert runtime.close_calls == 2
+
+
+def test_health_checks_redis_and_ray(
+    monkeypatch: Any,
+    tmp_path: Path,
+    capsys: Any,
+) -> None:
+    path, value = _config_file(tmp_path)
+    validation_calls: list[bool] = []
+    ray_calls: list[dict[str, object]] = []
+
+    class Plugin:
+        def validate_config(
+            self,
+            _config: dict[str, object],
+            *,
+            check_connectivity: bool = False,
+        ) -> None:
+            validation_calls.append(check_connectivity)
+
+    monkeypatch.setattr(cli, "KnovaBrokerPlugin", Plugin)
+    monkeypatch.setattr(cli, "_check_ray", lambda config: ray_calls.append(config))
+
+    assert cli.main(["health", "--config", str(path)]) == 0
+    assert validation_calls == [True]
+    assert ray_calls == [value]
+    assert capsys.readouterr().out == "KnoVa consumer dependencies are healthy\n"
 
 
 def test_consume_without_once_runs_forever(

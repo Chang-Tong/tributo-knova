@@ -19,10 +19,11 @@ Redis consumer or create a parallel training/inference API.
 
 ## Milestone 1 — protocol and broker vertical slice
 
-Status: implemented and covered by unit tests. The imported Broker watchdog now
-publishes `FAILED` when a Ray Job exits before the driver can create its
-reporter; the KnoVa adapter verifies that this uses the protocol-v2 terminal
-envelope.
+Status: implemented and covered by unit tests and the local recovery smoke
+test. The imported Broker watchdog publishes `FAILED` when a Ray Job exits
+before the driver can create its reporter. On Consumer startup it reclaims
+pending Redis deliveries and reconstructs active cancellation/watchdog state
+from credential-free Ray Job metadata.
 
 - Accept the current training and inference v2 envelopes. Keep `job_id` on the
   training wire while using `TrainingExecutionRequest` and `execution_id`
@@ -59,10 +60,16 @@ until its separate recovery gate is available.
   KnoVa. Add metrics only through an upstream exporter contract rather than
   inventing a KnoVa-only file format.
 - Preserve request-digest idempotency and terminal replay behavior.
+- Validate the published Bundle digest and identity before projecting the
+  complete KnoVa v2 `training_result`, `result_summary`, and
+  `artifact_manifest`. Preserve exact artifact paths, sizes, and SHA-256 values.
 
-Acceptance: two-worker training produces ONNX and UBJ artifacts, resumes from a
-shared checkpoint where supported, uploads the final Bundle to S3, and emits one
-KnoVa terminal event.
+Acceptance: two-worker training produces ONNX and UBJ artifacts, persists a
+shared checkpoint, uploads and reloads the final Bundle through S3, and emits
+one KnoVa terminal event. Cross-restart resume is deferred until the upstream
+boosting recovery gate exists. A physical `metrics.json` and non-empty terminal
+evaluation remain deferred until the official execution/export contracts
+provide real evaluation data; KnoVa does not fabricate metrics.
 
 ## Milestone 3 — batch inference and ClickHouse
 
@@ -81,21 +88,27 @@ remains open because the current upstream native predictor drops feature names.
   point and `data-write-v1` receipt contract. The sink delegates to Ray's native
   ClickHouse writer and keeps credentials out of the public Core request and
   receipt.
-- Map ONNX and UBJ model references to Tributo's existing Bundle inference
-  runtime. Use exact TreeSHAP where the model flavor supports it and Tributo's
-  approximate explainer otherwise.
+- Map the protocol's ONNX and XGBoost alternatives to Tributo's existing
+  Bundle inference runtime. Use ONNX for prediction and the official UBJ native
+  role for exact or explicitly approximate TreeSHAP.
 - Keep adaptive batch sizing as a bounded KnoVa execution policy around the
   existing inference executor.
 
-Acceptance: ClickHouse-to-ClickHouse inference works for ONNX and UBJ Bundles,
-emits exact or explicitly marked approximate SHAP output, and reduces batch size
-without losing or duplicating rows when memory pressure is simulated.
+Acceptance: ClickHouse-to-ClickHouse inference consumes the training
+`artifact_manifest` unchanged, predicts through ONNX, emits exact or explicitly
+marked approximate UBJ TreeSHAP output, and reduces batch size without losing
+or duplicating rows when memory pressure is simulated. Direct UBJ-only
+prediction remains deferred until the upstream native predictor preserves
+feature names.
 
 ## Milestone 4 — operations and release
 
-Status: a repeatable local Redis/Ray/ClickHouse smoke test exists. Container,
-systemd, health/readiness, offline packaging, and recovery/failure matrices
-remain open.
+Status: a repeatable local Redis/Ray/ClickHouse/S3 smoke test exists. The
+non-root Consumer image, Redis/Ray/Consumer Compose stack, Redis+Ray readiness
+command, hardened systemd unit, and verified zstd offline packaging flow are
+implemented. Pending-delivery recovery, admitted-Ray-Job recovery, cancellation,
+watchdog, duplicate terminal suppression, and retry paths are covered by tests.
+Compatible upstream release tags remain open.
 
 - Add the consumer image, Compose example, systemd unit, health/readiness
   checks, and zstd offline image packaging.
@@ -104,5 +117,7 @@ remain open.
 - Pin compatible releases of Tributo, the Redis broker and official algorithm
   packages before tagging `tributo-knova` 1.0.
 
-Acceptance: one documented online deployment and one offline deployment pass
-the same smoke test and can recover an in-flight task after consumer restart.
+Acceptance: the online Compose deployment and verified offline image package
+run the same Consumer image. The local integration smoke recovers and cancels
+both a pending delivery and an admitted in-flight Ray Job after Consumer
+restart.

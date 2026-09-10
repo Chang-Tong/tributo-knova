@@ -1,0 +1,69 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ray-head:
+    image: tributo-knova:${TRIBUTO_KNOVA_TAG:-local}
+    build:
+      context: .
+      args:
+        VERSION: ${TRIBUTO_KNOVA_VERSION:-0.1.0}
+    command:
+      - ray
+      - start
+      - --head
+      - --dashboard-host=0.0.0.0
+      - --dashboard-port=8265
+      - --num-cpus=${RAY_NUM_CPUS:-4}
+      - --disable-usage-stats
+      - --block
+    shm_size: 6gb
+    environment: &storage-environment
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8265/api/version', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  consumer:
+    image: tributo-knova:${TRIBUTO_KNOVA_TAG:-local}
+    build:
+      context: .
+      args:
+        VERSION: ${TRIBUTO_KNOVA_VERSION:-0.1.0}
+    init: true
+    command:
+      - tributo-knova
+      - consume
+      - --config
+      - /etc/tributo-knova/config.json
+    environment: *storage-environment
+    volumes:
+      - ./deploy/config/knova-compose.json:/etc/tributo-knova/config.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      ray-head:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  redis-data:
