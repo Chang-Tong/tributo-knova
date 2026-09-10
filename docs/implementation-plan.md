@@ -44,8 +44,11 @@ Ray driver.
 
 Status: the public algorithm dispatcher, two-worker XGBoost execution, NFS/NAS
 storage mapping, and content-addressed Bundle publication are implemented and
-covered by the local end-to-end smoke test. S3 publication and checkpoint
-resume/failure injection remain open.
+covered by the local end-to-end smoke test. The same test now verifies the Ray
+checkpoint artifacts on shared storage and publishes/loads the final Bundle
+through a local S3-compatible RustFS service. Cross-restart resume remains open:
+the pinned official boosting implementation explicitly rejects `resume_from`
+until its separate recovery gate is available.
 
 - Map the existing training request to Tributo's formal algorithm execution
   contracts and use `tributo-algorithms-boosting` for distributed XGBoost.

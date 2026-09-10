@@ -13,6 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import clickhouse_connect
 import redis
@@ -74,6 +75,16 @@ def _arguments() -> argparse.Namespace:
         choices=("none", "exact", "approximate"),
         default="none",
         help="Enable XGBoost TreeSHAP and verify its ClickHouse result payload.",
+    )
+    parser.add_argument(
+        "--storage-mode",
+        choices=("nfs", "s3"),
+        default="nfs",
+        help="Publish the final Bundle locally or to an S3-compatible store.",
+    )
+    parser.add_argument(
+        "--s3-bucket",
+        default=os.environ.get("TRIBUTO_KNOVA_SMOKE_S3_BUCKET", "tributo-knova-smoke"),
     )
     parser.add_argument("--keep-tables", action="store_true")
     parser.add_argument("--timeout", type=float, default=180.0)
@@ -211,8 +222,17 @@ def _training_request(
     job_id: str,
     table: str,
     storage_root: str,
+    storage_prefix: str,
     password: str,
 ) -> dict[str, Any]:
+    storage_context = {
+        "type": args.storage_mode,
+        "bucket": storage_root if args.storage_mode == "nfs" else args.s3_bucket,
+        "prefix": storage_prefix,
+        "properties": (
+            {} if args.storage_mode == "nfs" else {"ray_storage_path": storage_root}
+        ),
+    }
     return {
         "protocol_version": "2.0",
         "job_id": job_id,
@@ -238,12 +258,7 @@ def _training_request(
             "task_type": "BINARY_CLASSIFICATION",
             "label_mapping": {"active": 0, "churn": 1},
         },
-        "storage_context": {
-            "type": "nfs",
-            "bucket": storage_root,
-            "prefix": "bundle",
-            "properties": {},
-        },
+        "storage_context": storage_context,
         "extensions": {
             "tributo": {
                 "training_runtime": {"ray": {"num_workers": 2, "cpus_per_worker": 1}}
@@ -341,6 +356,65 @@ def _inference_request(
     return request
 
 
+def _s3_client() -> Any:
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+        region_name=os.environ.get("AWS_REGION"),
+        config=Config(s3={"addressing_style": "path"}),
+    )
+
+
+def _ensure_s3_bucket(client: Any, bucket: str) -> None:
+    from botocore.exceptions import ClientError
+
+    try:
+        client.head_bucket(Bucket=bucket)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code not in {"404", "NoSuchBucket", "NotFound"}:
+            raise
+        client.create_bucket(Bucket=bucket)
+
+
+def _s3_bundle_files(client: Any, bundle_uri: str) -> list[str]:
+    parsed = urlsplit(bundle_uri)
+    prefix = parsed.path.lstrip("/").rstrip("/") + "/"
+    response = client.list_objects_v2(Bucket=parsed.netloc, Prefix=prefix)
+    files = [
+        item["Key"].removeprefix(prefix)
+        for item in response.get("Contents", ())
+        if item["Key"] != prefix
+    ]
+    if "manifest.json" not in files:
+        raise RuntimeError("S3 Bundle manifest was not published")
+    return sorted(files)
+
+
+def _delete_s3_prefix(client: Any, bucket: str, prefix: str) -> None:
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix.rstrip("/") + "/"):
+        objects = [{"Key": item["Key"]} for item in page.get("Contents", ())]
+        if objects:
+            client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+
+
+def _checkpoint_artifacts(storage_root: str) -> list[str]:
+    names = sorted(
+        {
+            path.name
+            for path in Path(storage_root).rglob("*")
+            if path.is_file() and path.name in {"model.ubj", "feature_names.json"}
+        }
+    )
+    if names != ["feature_names.json", "model.ubj"]:
+        raise RuntimeError("Ray shared storage does not contain an XGBoost checkpoint")
+    return names
+
+
 def main() -> int:
     args = _arguments()
     password = os.environ.get(args.clickhouse_password_env)
@@ -352,6 +426,7 @@ def main() -> int:
     output_table = f"tributo_knova_output_{suffix}"
     job_id = f"knova-train-smoke-{suffix}"
     execution_id = f"knova-infer-smoke-{suffix}"
+    storage_prefix = "bundle" if args.storage_mode == "nfs" else f"smoke/{suffix}"
     redis_client = redis.Redis.from_url(args.redis_url, decode_responses=True)
     clickhouse = clickhouse_connect.get_client(
         host=args.clickhouse_host,
@@ -361,7 +436,11 @@ def main() -> int:
     )
     storage_root = tempfile.mkdtemp(prefix="tributo-knova-smoke-")
     runtime = None
+    s3 = None
     try:
+        if args.storage_mode == "s3":
+            s3 = _s3_client()
+            _ensure_s3_bucket(s3, args.s3_bucket)
         clickhouse.command("CREATE DATABASE IF NOT EXISTS knova")
         clickhouse.command(
             f"CREATE TABLE knova.{input_table} ("
@@ -391,6 +470,7 @@ def main() -> int:
             job_id=job_id,
             table=input_table,
             storage_root=storage_root,
+            storage_prefix=storage_prefix,
             password=password,
         )
         _submit(
@@ -408,6 +488,13 @@ def main() -> int:
         )
         _require_success(training_terminal, job_id)
         bundle_uri = training_terminal["training_result"]["bundle_uri"]
+        checkpoint_artifacts = _checkpoint_artifacts(storage_root)
+        if args.storage_mode == "s3":
+            if not bundle_uri.startswith(f"s3://{args.s3_bucket}/"):
+                raise RuntimeError("training did not publish the Bundle to S3")
+            bundle_files = _s3_bundle_files(s3, bundle_uri)
+        else:
+            bundle_files = sorted(path.name for path in Path(bundle_uri).iterdir())
 
         inference = _inference_request(
             args,
@@ -471,9 +558,9 @@ def main() -> int:
                     "training": {
                         "job_id": job_id,
                         "events": [event["event_type"] for event in training_events],
-                        "bundle_files": sorted(
-                            path.name for path in Path(bundle_uri).iterdir()
-                        ),
+                        "bundle_files": bundle_files,
+                        "checkpoint_artifacts": checkpoint_artifacts,
+                        "storage_mode": args.storage_mode,
                     },
                     "inference": {
                         "execution_id": execution_id,
@@ -496,6 +583,9 @@ def main() -> int:
             clickhouse.command(f"DROP TABLE IF EXISTS knova.{input_table}")
         clickhouse.close()
         redis_client.close()
+        if s3 is not None:
+            _delete_s3_prefix(s3, args.s3_bucket, storage_prefix)
+            s3.close()
         shutil.rmtree(storage_root, ignore_errors=True)
 
 

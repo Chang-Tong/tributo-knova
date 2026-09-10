@@ -18,8 +18,8 @@ and acknowledgements remain owned by `tributo-broker-redis`.
 
 See [the implementation plan](docs/implementation-plan.md) for the completed
 vertical slices and the remaining release work. This branch is not a 1.0
-release yet: S3 publication, checkpoint-resume testing, direct UBJ-only
-prediction, and production deployment assets remain open.
+release yet: checkpoint-resume support, direct UBJ-only prediction, and
+production deployment assets remain open.
 
 ## Development
 
@@ -52,3 +52,18 @@ The SHAP modes additionally verify the explanation exactness and feature width
 inside a real ClickHouse `pred_extra` result.
 Sibling source checkouts can be overridden with `--core-root`,
 `--broker-root`, and `--algorithms-root`.
+
+To exercise shared Ray checkpoint storage and S3-compatible final Bundle
+publication, configure the standard AWS credential chain on the Ray nodes and
+the smoke-test process, then run:
+
+```bash
+export AWS_ENDPOINT_URL='http://127.0.0.1:9100'
+export AWS_REGION='us-east-1'
+uv run python scripts/local_smoke.py --storage-mode s3 --shap-mode exact
+```
+
+Credentials stay in the deployment environment; they are not copied into the
+KnoVa request, Bundle manifest, or Ray Job metadata. The smoke test creates an
+isolated object prefix, verifies the published ONNX, UBJ and manifest objects,
+loads that S3 Bundle for inference, and removes the prefix afterward.
