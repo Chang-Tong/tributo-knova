@@ -20,6 +20,16 @@ from tributo_knova.reporter import KnovaRedisEventReporter
 DRIVER_ENTRYPOINT = "python -m tributo_knova.execution_driver"
 
 
+def _redis_broker_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate only the provider identity to the imported Redis contract."""
+    value = dict(config)
+    broker_id = value.get("broker_id", "tributo-knova")
+    if broker_id != "tributo-knova":
+        raise ValueError("broker_id must be tributo-knova")
+    value["broker_id"] = "tributo-redis"
+    return value
+
+
 def parse_broker_request(
     raw_payload: str,
     *,
@@ -85,13 +95,13 @@ class KnovaBrokerPlugin(BrokerPlugin):
         check_connectivity: bool = False,
     ) -> None:
         RedisBrokerPlugin().validate_config(
-            config,
+            _redis_broker_config(config),
             check_connectivity=check_connectivity,
         )
 
     def create_runtime(self, config: Mapping[str, Any]) -> BrokerRuntime:
         return RedisBrokerRuntime(
-            normalize_config(config),
+            normalize_config(_redis_broker_config(config)),
             request_parser=parse_broker_request,
             operation_preparer=prepare_broker_operation,
             driver_entrypoint=DRIVER_ENTRYPOINT,

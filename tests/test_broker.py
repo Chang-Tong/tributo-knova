@@ -12,6 +12,7 @@ from tributo_broker_redis.runtime import RedisBrokerRuntime
 
 from tributo_knova.broker import (
     DRIVER_ENTRYPOINT,
+    _redis_broker_config,
     parse_broker_request,
     prepare_broker_operation,
 )
@@ -199,3 +200,17 @@ def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
         "protocol_version": "2.0",
         "timestamp": admitted["timestamp"],
     }
+
+
+def test_knova_config_identity_is_adapted_without_mutating_input() -> None:
+    value = {"broker_id": "tributo-knova", "api_version": 1}
+
+    adapted = _redis_broker_config(value)
+
+    assert adapted == {"broker_id": "tributo-redis", "api_version": 1}
+    assert value["broker_id"] == "tributo-knova"
+
+
+def test_foreign_broker_identity_is_rejected() -> None:
+    with pytest.raises(ValueError, match="broker_id must be tributo-knova"):
+        _redis_broker_config({"broker_id": "other"})

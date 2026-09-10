@@ -213,7 +213,7 @@ def test_driver_rejects_payload_identity_mismatch_safely() -> None:
     assert _REQUEST_SECRET not in str(captured.value)
 
 
-def test_missing_execution_publishes_sanitized_v2_failure_and_closes_redis(
+def test_unavailable_execution_publishes_sanitized_v2_failure_and_closes_redis(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -226,7 +226,13 @@ def test_missing_execution_publishes_sanitized_v2_failure_and_closes_redis(
         lambda _url: redis,
     )
     monkeypatch.setattr(execution_driver, "_initialize_ray", lambda: None)
-    monkeypatch.delitem(sys.modules, "tributo_knova.training", raising=False)
+    monkeypatch.setattr(
+        execution_driver,
+        "_execute_training",
+        lambda *_args: (_ for _ in ()).throw(
+            execution_driver.ExecutionNotImplemented()
+        ),
+    )
 
     with caplog.at_level(logging.DEBUG):
         assert execution_driver.main() == 1

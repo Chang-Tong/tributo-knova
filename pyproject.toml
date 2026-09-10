@@ -5,13 +5,18 @@ description = "KnoVa integration for Tributo"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+    "clickhouse-connect>=1.5,<1.6",
     "pydantic>=2.0,<3.0",
     "tributo>=1.0,<2.0",
+    "tributo-algorithms-boosting>=0.1,<1.0",
     "tributo-broker-redis>=0.1,<1.0",
 ]
 
 [project.entry-points."tributo.brokers"]
 tributo-knova = "tributo_knova.broker:KnovaBrokerPlugin"
+
+[project.entry-points."tributo.ingestion_bindings"]
+tributo-knova-clickhouse = "tributo_knova.clickhouse:clickhouse_binding_descriptor"
 
 [project.scripts]
 tributo-knova = "tributo_knova.cli:main"
@@ -31,6 +36,7 @@ packages = ["src/tributo_knova"]
 
 [tool.uv.sources]
 tributo = { path = "../tributo", editable = true }
+"tributo-algorithms-boosting" = { path = "../tributo-algorithms/packages/boosting", editable = true }
 "tributo-broker-redis" = { path = "../tributo-broker-redis", editable = true }
 
 [tool.pytest.ini_options]
