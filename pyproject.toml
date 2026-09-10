@@ -13,6 +13,9 @@ dependencies = [
 [project.entry-points."tributo.brokers"]
 tributo-knova = "tributo_knova.broker:KnovaBrokerPlugin"
 
+[project.scripts]
+tributo-knova = "tributo_knova.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
