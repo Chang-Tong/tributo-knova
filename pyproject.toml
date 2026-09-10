@@ -10,6 +10,9 @@ dependencies = [
     "tributo-broker-redis>=0.1,<1.0",
 ]
 
+[project.entry-points."tributo.brokers"]
+tributo-knova = "tributo_knova.broker:KnovaBrokerPlugin"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

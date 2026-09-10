@@ -1,5 +1,6 @@
 """KnoVa integration for Tributo."""
 
+from tributo_knova.broker import KnovaBrokerPlugin
 from tributo_knova.protocol import (
     InferenceExecutionRequest,
     KnovaProtocolFailure,
@@ -9,8 +10,8 @@ from tributo_knova.protocol import (
 
 __all__ = [
     "InferenceExecutionRequest",
+    "KnovaBrokerPlugin",
     "KnovaProtocolFailure",
     "TrainingExecutionRequest",
     "parse_request",
 ]
-

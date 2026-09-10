@@ -7,17 +7,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from tributo_broker_redis.config import OperationType
+from tributo_broker_redis.protocol import ProtocolFailure
 
 PROTOCOL_VERSION = "2.0"
 
 
-class KnovaProtocolFailure(ValueError):
+class KnovaProtocolFailure(ProtocolFailure):
     """Credential-safe rejection raised before broker admission."""
 
     def __init__(self, code: str, sanitized_message: str) -> None:
-        super().__init__(sanitized_message)
-        self.code = code
-        self.sanitized_message = sanitized_message
+        super().__init__(code, sanitized_message)
 
 
 class _Request(BaseModel):
@@ -149,4 +148,3 @@ __all__ = [
     "TrainingExecutionRequest",
     "parse_request",
 ]
-
