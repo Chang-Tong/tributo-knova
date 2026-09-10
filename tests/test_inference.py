@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -180,6 +181,27 @@ def test_standalone_onnx_maps_to_public_artifact_importer() -> None:
     assert core.model.options["input_fields"][0]["shape"] == ["batch", 2]
 
 
+def test_tree_shap_keeps_onnx_prediction_and_selects_native_attribution() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["extensions"] = {
+        "explanation": {
+            "enabled": True,
+            "method": "TREE_SHAP",
+            "approximate": False,
+        }
+    }
+
+    core, sink, _credentials = inference._build_request(
+        InferenceExecutionRequest.model_validate(payload)
+    )
+
+    assert core.model.kind == "bundle"
+    assert core.model.role == "inference"
+    assert sink._model_reference["kind"] == "bundle"
+    assert sink._model_reference["role"] == "native"
+    assert sink._explanation == {"method": "TREE_SHAP", "approximate": False}
+
+
 def test_complex_query_is_rejected_without_executing_raw_sql() -> None:
     payload = _request().model_dump(mode="python")
     payload["input"]["query"]["sql"] = (
@@ -351,6 +373,86 @@ def test_protocol_batch_maps_binary_result_schema() -> None:
     }
 
 
+def test_protocol_batch_embeds_explicit_tree_shap_exactness() -> None:
+    frame = pd.DataFrame(
+        {
+            "user_id": [11],
+            "spend": [10.5],
+            "active_days": [30],
+            "__knova_label": [1],
+            "__knova_probabilities": [[0.1, 0.9]],
+            "__knova_shap_values": [[0.25, -0.5]],
+            "__knova_shap_base": [0.75],
+            "__knova_shap_group": [0],
+        }
+    )
+    task = _request().model_dump(mode="python")
+    task["extensions"] = {
+        "explanation": {
+            "enabled": True,
+            "method": "TREE_SHAP",
+            "approximate": True,
+        }
+    }
+
+    result = inference._protocol_batch(
+        frame,
+        task=task,
+        entity_column="user_id",
+        feature_columns=("spend", "active_days"),
+        feature_result_names=("t0__spend", "t0__active_days"),
+    )
+
+    explanation = json.loads(result["pred_extra"][0])["explanation"]
+    assert explanation["exactness"] == "approximate"
+    assert explanation["approximate"] is True
+    assert explanation["output_space"] == "RAW_MARGIN"
+    assert explanation["explained_class_label"] == "churn"
+    assert explanation["feature_contributions"] == [
+        {"feature_name": "t0__spend", "shap_value": 0.25},
+        {"feature_name": "t0__active_days", "shap_value": -0.5},
+    ]
+
+
+@pytest.mark.parametrize("approximate", [False, True])
+def test_tree_shap_batch_loads_ubj_and_preserves_rows(
+    tmp_path: Path,
+    approximate: bool,
+) -> None:
+    import numpy as np
+    import xgboost
+
+    values = np.asarray([[0.0, 1.0], [1.0, 0.0], [2.0, 2.0]], dtype=np.float32)
+    labels = np.asarray([0, 0, 1], dtype=np.float32)
+    matrix = xgboost.DMatrix(values, label=labels, feature_names=["f1", "f2"])
+    booster = xgboost.train(
+        {"objective": "binary:logistic", "max_depth": 2},
+        matrix,
+        num_boost_round=2,
+    )
+    model_path = tmp_path / "model.ubj"
+    booster.save_model(model_path)
+    frame = pd.DataFrame(
+        {
+            "f1": values[:, 0],
+            "f2": values[:, 1],
+            "__knova_label": [0, 0, 1],
+        }
+    )
+    worker = inference._TreeShapBatch(
+        model_reference={"kind": "artifact", "uri": str(model_path)},
+        feature_columns=("f1", "f2"),
+        task_type="BINARY_CLASSIFICATION",
+        approximate=approximate,
+    )
+
+    result = worker(frame)
+
+    assert len(result) == len(frame)
+    assert all(len(row) == 2 for row in result["__knova_shap_values"])
+    assert result["__knova_shap_group"].tolist() == [0, 0, 0]
+
+
 def test_bound_sink_delegates_to_ray_native_clickhouse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -390,3 +492,50 @@ def test_bound_sink_delegates_to_ray_native_clickhouse(
     assert write["max_insert_block_rows"] == 500
     assert receipt.rows_written == 7
     assert _SECRET not in receipt.model_dump_json()
+
+
+def test_tree_shap_sink_releases_predictor_actors_before_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _request().model_dump(mode="python")
+    payload["extensions"] = {"explanation": {"enabled": True, "method": "TREE_SHAP"}}
+    _core, sink, _credentials = inference._build_request(
+        InferenceExecutionRequest.model_validate(payload)
+    )
+    calls: list[str] = []
+
+    class Dataset:
+        def map_batches(self, fn: Any, **_kwargs: Any) -> Dataset:
+            calls.append(f"map:{fn.__name__}")
+            return self
+
+        def materialize(self) -> Dataset:
+            calls.append("materialize")
+            return self
+
+        def count(self) -> int:
+            calls.append("count")
+            return 1
+
+        def write_clickhouse(self, **_kwargs: Any) -> None:
+            calls.append("write")
+
+    import ray.data
+
+    monkeypatch.setattr(ray.data, "SinkMode", SimpleNamespace(APPEND="append"))
+    monkeypatch.setattr(
+        ray.data,
+        "ActorPoolStrategy",
+        lambda *, size: ("actors", size),
+    )
+
+    sink.write(Dataset(), run_id="inference-1", plan_digest="a" * 64)
+
+    assert calls == [
+        "materialize",
+        "map:_TreeShapBatch",
+        "map:_protocol_batch",
+        "materialize",
+        "count",
+        "write",
+    ]

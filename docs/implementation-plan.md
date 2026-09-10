@@ -67,7 +67,10 @@ Status: Ray-native ClickHouse reads, ONNX Bundle inference, protocol-v2 result
 mapping, ClickHouse writes, filter pushdown, and exact terminal row counts are
 implemented and covered by the local end-to-end smoke test. Measured-row
 adaptive batch sizing and bounded pre-write memory-pressure retries are also
-implemented. UBJ-native runtime and SHAP remain open.
+implemented. Exact and explicitly marked approximate TreeSHAP use the official
+Bundle native role/UBJ model after public Tributo ONNX prediction; both modes
+are covered by the same end-to-end smoke test. Direct UBJ-only prediction
+remains open because the current upstream native predictor drops feature names.
 
 - Implement a KnoVa-owned Ray-native ClickHouse ingestion Binding through
   Tributo's `tributo.ingestion_bindings` entry point.

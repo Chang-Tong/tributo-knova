@@ -9,7 +9,7 @@ import os
 import posixpath
 import re
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
@@ -157,6 +157,8 @@ def _signature_fields(
 
 def _artifact_alternative(
     model: Mapping[str, Any],
+    *,
+    prefer_ubj: bool = False,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     artifacts = _mapping(model.get("model_artifacts"), "model.model_artifacts")
     weights = _mapping(
@@ -178,9 +180,34 @@ def _artifact_alternative(
             supported.append((raw, file))
     if not supported:
         _invalid("model artifacts require one ONNX or UBJ weight file")
+    preferred_format = "ubj" if prefer_ubj else "onnx"
     return next(
-        (item for item in supported if item[0].get("format") == "onnx"), supported[0]
+        (item for item in supported if item[0].get("format") == preferred_format),
+        supported[0],
     )
+
+
+def _explanation_options(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    extensions = payload.get("extensions")
+    raw = extensions.get("explanation") if isinstance(extensions, Mapping) else None
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        _invalid("extensions.explanation must be an object")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        _invalid("extensions.explanation.enabled must be a boolean")
+    if not enabled:
+        return None
+    if str(raw.get("method") or "TREE_SHAP").upper() != "TREE_SHAP":
+        _invalid("extensions.explanation.method must be TREE_SHAP")
+    approximate = raw.get("approximate", False)
+    if not isinstance(approximate, bool):
+        _invalid("extensions.explanation.approximate must be a boolean")
+    model = _mapping(payload.get("model"), "model")
+    if str(model.get("algorithm_key") or "").lower() != "xgboost":
+        _invalid("TREE_SHAP requires model.algorithm_key=xgboost")
+    return {"method": "TREE_SHAP", "approximate": approximate}
 
 
 def _model_reference(
@@ -188,6 +215,7 @@ def _model_reference(
     *,
     execution_id: str,
     features: tuple[str, ...],
+    prefer_native: bool = False,
 ) -> BundleModelReference | ArtifactModelReference:
     model = dict(model_value)
     explicit_bundle = model.get("bundle_uri")
@@ -195,13 +223,19 @@ def _model_reference(
     properties = _mapping(storage.get("properties", {}), "model.storage.properties")
     explicit_bundle = explicit_bundle or properties.get("bundle_uri")
     if explicit_bundle is not None:
-        return BundleModelReference(uri=_text(explicit_bundle, "model.bundle_uri"))
+        return BundleModelReference(
+            uri=_text(explicit_bundle, "model.bundle_uri"),
+            role="native" if prefer_native else "inference",
+        )
 
     root = _storage_root(storage)
     if not root.startswith("s3://") and (Path(root) / "manifest.json").is_file():
-        return BundleModelReference(uri=root)
+        return BundleModelReference(
+            uri=root,
+            role="native" if prefer_native else "inference",
+        )
 
-    alternative, file = _artifact_alternative(model)
+    alternative, file = _artifact_alternative(model, prefer_ubj=prefer_native)
     format_id = _text(alternative.get("format"), "model artifact format").lower()
     metadata = _mapping(file.get("metadata", {}), "model artifact metadata")
     input_fields, output_fields = _signature_fields(
@@ -464,11 +498,25 @@ def _build_request(
             },
         },
     )
+    explanation = _explanation_options(payload)
     model_reference = _model_reference(
         model,
         execution_id=request.execution_id,
         features=features,
     )
+    attribution_model_reference = model_reference
+    if explanation is not None:
+        attribution_model_reference = _model_reference(
+            model,
+            execution_id=request.execution_id,
+            features=features,
+            prefer_native=True,
+        )
+    if explanation is not None and (
+        not isinstance(attribution_model_reference, BundleModelReference)
+        and attribution_model_reference.format_id != "ubj"
+    ):
+        _invalid("TREE_SHAP requires a UBJ model artifact")
     input_name = (
         model_reference.options["input_fields"][0]["name"]
         if isinstance(model_reference, ArtifactModelReference)
@@ -554,6 +602,9 @@ def _build_request(
         feature_columns=features,
         feature_result_names=result_names,
         batch_size=sink_batch_size,
+        concurrency=concurrency,
+        explanation=explanation,
+        model_reference=attribution_model_reference,
     )
     return core_request, sink, (username, password)
 
@@ -567,9 +618,7 @@ def _execution_policy(
     execution = _mapping(payload.get("execution", {}), "execution")
     extensions = payload.get("extensions")
     tributo = extensions.get("tributo") if isinstance(extensions, Mapping) else None
-    runtime = (
-        tributo.get("inference_runtime") if isinstance(tributo, Mapping) else None
-    )
+    runtime = tributo.get("inference_runtime") if isinstance(tributo, Mapping) else None
     options = runtime if isinstance(runtime, Mapping) else {}
     target_batches = _positive_int(
         options.get("adaptive_target_batches"),
@@ -598,9 +647,7 @@ def _execution_policy(
             maximum,
         )
     else:
-        base = _positive_int(
-            execution.get("batch_size"), "execution.batch_size", 4096
-        )
+        base = _positive_int(execution.get("batch_size"), "execution.batch_size", 4096)
     predictor_batch = _positive_int(
         options.get("predictor_batch_size"),
         "extensions.tributo.inference_runtime.predictor_batch_size",
@@ -687,6 +734,119 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+class _TreeShapBatch:
+    """Load the official UBJ runtime once per Ray actor and add row attributions."""
+
+    def __init__(
+        self,
+        *,
+        model_reference: Mapping[str, Any],
+        feature_columns: tuple[str, ...],
+        task_type: str,
+        approximate: bool,
+    ) -> None:
+        import xgboost
+
+        self._runtime: Any | None = None
+        self._feature_columns = feature_columns
+        self._task_type = task_type
+        self._approximate = approximate
+        if model_reference.get("kind") == "bundle":
+            from tributo.exporting.runtime import BundleModelLoader
+
+            self._runtime = BundleModelLoader().open(
+                _text(model_reference.get("uri"), "model bundle URI"),
+                role=_text(model_reference.get("role"), "model bundle role"),
+                storage_profile=model_reference.get("storage_profile"),
+                expected_manifest_sha256=model_reference.get(
+                    "expected_manifest_sha256"
+                ),
+                use_case="batch",
+            )
+            model = self._runtime.model
+            booster = getattr(model, "native_model_object", None)
+            if not isinstance(booster, xgboost.Booster):
+                raise TypeError("Bundle native role is not an XGBoost Booster")
+            self._booster = booster
+        else:
+            uri = _text(model_reference.get("uri"), "UBJ artifact URI")
+            payload = _read_artifact_bytes(uri)
+            expected = model_reference.get("expected_sha256")
+            if expected is not None and hashlib.sha256(payload).hexdigest() != expected:
+                raise ValueError("UBJ artifact digest does not match expected_sha256")
+            self._booster = xgboost.Booster()
+            self._booster.load_model(bytearray(payload))
+
+        model_names = tuple(self._booster.feature_names or ())
+        if model_names and model_names != feature_columns:
+            raise ValueError("XGBoost feature names do not match inference columns")
+
+    def __call__(self, frame: Any) -> Any:
+        import numpy as np
+        import xgboost
+
+        values = frame.loc[:, list(self._feature_columns)].to_numpy(dtype=np.float32)
+        matrix = xgboost.DMatrix(
+            values,
+            feature_names=list(self._feature_columns),
+        )
+        contributions = np.asarray(
+            self._booster.predict(
+                matrix,
+                pred_contribs=True,
+                approx_contribs=self._approximate,
+                strict_shape=True,
+            ),
+            dtype=np.float64,
+        )
+        expected = (len(frame), len(self._feature_columns) + 1)
+        if contributions.ndim != 3 or contributions.shape[0] != len(frame):
+            raise ValueError("XGBoost TreeSHAP output shape is invalid")
+        if contributions.shape[2] != expected[1]:
+            raise ValueError("XGBoost TreeSHAP feature width is invalid")
+        if self._task_type == "MULTICLASS_CLASSIFICATION":
+            groups = np.asarray(frame["__knova_label"], dtype=np.int64)
+        else:
+            groups = np.zeros(len(frame), dtype=np.int64)
+        if np.any(groups < 0) or np.any(groups >= contributions.shape[1]):
+            raise ValueError("XGBoost TreeSHAP output group is invalid")
+        selected = contributions[np.arange(len(frame)), groups]
+        result = frame.copy()
+        result["__knova_shap_values"] = list(selected[:, :-1])
+        result["__knova_shap_base"] = selected[:, -1]
+        result["__knova_shap_group"] = groups
+        return result
+
+    def __del__(self) -> None:
+        runtime = getattr(self, "_runtime", None)
+        if runtime is not None:
+            with suppress(Exception):
+                runtime.close()
+
+
+def _read_artifact_bytes(uri: str) -> bytes:
+    if uri.startswith("s3://"):
+        from urllib.parse import urlsplit
+
+        import boto3
+
+        parsed = urlsplit(uri)
+        key = parsed.path.lstrip("/")
+        if not parsed.netloc or not key:
+            raise ValueError("S3 UBJ artifact URI is invalid")
+        response = boto3.client(
+            "s3",
+            endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+        ).get_object(Bucket=parsed.netloc, Key=key)
+        body = response["Body"]
+        try:
+            return bytes(body.read())
+        finally:
+            body.close()
+    path = Path(uri.removeprefix("file://"))
+    return path.read_bytes()
+
+
 def _protocol_batch(
     frame: Any,
     *,
@@ -732,22 +892,63 @@ def _protocol_batch(
         if prediction is not None and task_type == "REGRESSION"
         else [None] * rows
     )
+    explanation = _explanation_options(task)
+    shap_values = frame.get("__knova_shap_values")
+    shap_bases = frame.get("__knova_shap_base")
+    shap_groups = frame.get("__knova_shap_group")
     positions = {name: frame.columns.get_loc(name) for name in feature_columns}
     extras: list[str] = []
-    for row in frame.itertuples(index=False, name=None):
+    for row_index, row in enumerate(frame.itertuples(index=False, name=None)):
+        extra: dict[str, Any] = {
+            "inference_feature_values": [
+                {
+                    "feature_name": result_name,
+                    "value": _json_value(row[positions[column]]),
+                }
+                for column, result_name in zip(
+                    feature_columns, feature_result_names, strict=True
+                )
+            ]
+        }
+        if explanation is not None:
+            if shap_values is None or shap_bases is None or shap_groups is None:
+                raise ValueError("TREE_SHAP result columns are missing")
+            group = int(shap_groups.iloc[row_index])
+            explained_index = (
+                _positive_label_index(model)
+                if task_type == "BINARY_CLASSIFICATION"
+                else group
+            )
+            explanation_payload: dict[str, Any] = {
+                "method": "TREE_SHAP",
+                "output_space": "RAW_MARGIN",
+                "exactness": ("approximate" if explanation["approximate"] else "exact"),
+                "approximate": explanation["approximate"],
+                "base_value": float(shap_bases.iloc[row_index]),
+                "feature_contributions": [
+                    {
+                        "feature_name": name,
+                        "shap_value": float(value),
+                    }
+                    for name, value in zip(
+                        feature_result_names,
+                        shap_values.iloc[row_index],
+                        strict=True,
+                    )
+                ],
+            }
+            if task_type in {
+                "BINARY_CLASSIFICATION",
+                "MULTICLASS_CLASSIFICATION",
+            }:
+                explanation_payload["explained_class_index"] = explained_index
+                explanation_payload["explained_class_label"] = reverse.get(
+                    explained_index, str(explained_index)
+                )
+            extra["explanation"] = explanation_payload
         extras.append(
             json.dumps(
-                {
-                    "inference_feature_values": [
-                        {
-                            "feature_name": result_name,
-                            "value": _json_value(row[positions[column]]),
-                        }
-                        for column, result_name in zip(
-                            feature_columns, feature_result_names, strict=True
-                        )
-                    ]
-                },
+                extra,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -800,6 +1001,9 @@ class _ClickHouseResultSink:
         feature_columns: tuple[str, ...],
         feature_result_names: tuple[str, ...],
         batch_size: int,
+        concurrency: int,
+        explanation: Mapping[str, Any] | None,
+        model_reference: BundleModelReference | ArtifactModelReference,
     ) -> None:
         self._host = host
         self._port = port
@@ -812,6 +1016,9 @@ class _ClickHouseResultSink:
         self._feature_columns = feature_columns
         self._feature_result_names = feature_result_names
         self._batch_size = batch_size
+        self._concurrency = concurrency
+        self._explanation = dict(explanation) if explanation is not None else None
+        self._model_reference = model_reference.model_dump(mode="python")
 
     @property
     def sink_id(self) -> str:
@@ -824,23 +1031,41 @@ class _ClickHouseResultSink:
         run_id: str,
         plan_digest: str,
     ) -> ResultSinkReceipt:
-        transformed = dataset.map_batches(
-            _protocol_batch,
-            batch_format="pandas",
-            fn_kwargs={
-                "task": self._task,
-                "entity_column": self._entity_column,
-                "feature_columns": self._feature_columns,
-                "feature_result_names": self._feature_result_names,
-            },
-        )
+        import ray.data
+
         try:
+            if self._explanation is not None:
+                # The public inference runtime uses a predictor ActorPool. Finish
+                # that stage before allocating attribution actors so both pools
+                # do not reserve cluster CPUs at the same time.
+                dataset = dataset.materialize()
+                model = _mapping(self._task.get("model"), "model")
+                dataset = dataset.map_batches(
+                    _TreeShapBatch,
+                    batch_format="pandas",
+                    batch_size=self._batch_size,
+                    compute=ray.data.ActorPoolStrategy(size=self._concurrency),
+                    fn_constructor_kwargs={
+                        "model_reference": self._model_reference,
+                        "feature_columns": self._feature_columns,
+                        "task_type": str(model.get("task_type") or "").upper(),
+                        "approximate": self._explanation["approximate"],
+                    },
+                )
+            transformed = dataset.map_batches(
+                _protocol_batch,
+                batch_format="pandas",
+                fn_kwargs={
+                    "task": self._task,
+                    "entity_column": self._entity_column,
+                    "feature_columns": self._feature_columns,
+                    "feature_result_names": self._feature_result_names,
+                },
+            )
             transformed = transformed.materialize()
             rows_written = transformed.count()
         except Exception as exc:
             raise ResultMaterializationError(type(exc).__name__) from None
-        import ray.data
-
         try:
             transformed.write_clickhouse(
                 table=self._table,

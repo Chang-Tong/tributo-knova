@@ -69,6 +69,12 @@ def _arguments() -> argparse.Namespace:
         "--clickhouse-password-env",
         default="TRIBUTO_KNOVA_CLICKHOUSE_PASSWORD",
     )
+    parser.add_argument(
+        "--shap-mode",
+        choices=("none", "exact", "approximate"),
+        default="none",
+        help="Enable XGBoost TreeSHAP and verify its ClickHouse result payload.",
+    )
     parser.add_argument("--keep-tables", action="store_true")
     parser.add_argument("--timeout", type=float, default=180.0)
     return parser.parse_args()
@@ -133,10 +139,7 @@ def _runtime_config(args: argparse.Namespace, repository: Path) -> dict[str, Any
             "extra_py_modules": [
                 str(repository / "src/tributo_knova"),
                 str(broker / "src/tributo_broker_redis"),
-                str(
-                    algorithms
-                    / "packages/boosting/src/tributo_algorithms_boosting"
-                ),
+                str(algorithms / "packages/boosting/src/tributo_algorithms_boosting"),
             ],
             "env_vars": {"PATH": runtime_path},
             "entrypoint_num_cpus": 0,
@@ -150,8 +153,7 @@ def _events(
     stream: str,
 ) -> list[dict[str, Any]]:
     return [
-        json.loads(fields["payload"])
-        for _event_id, fields in client.xrange(stream)
+        json.loads(fields["payload"]) for _event_id, fields in client.xrange(stream)
     ]
 
 
@@ -165,9 +167,7 @@ def _wait_terminal(
     while time.monotonic() < deadline:
         events = _events(client, stream=stream)
         terminal = [
-            event
-            for event in events
-            if event.get("event_type") in _TERMINAL_EVENTS
+            event for event in events if event.get("event_type") in _TERMINAL_EVENTS
         ]
         if terminal:
             if len(terminal) != 1:
@@ -246,9 +246,7 @@ def _training_request(
         },
         "extensions": {
             "tributo": {
-                "training_runtime": {
-                    "ray": {"num_workers": 2, "cpus_per_worker": 1}
-                }
+                "training_runtime": {"ray": {"num_workers": 2, "cpus_per_worker": 1}}
             }
         },
     }
@@ -262,8 +260,9 @@ def _inference_request(
     output_table: str,
     bundle_uri: str,
     password: str,
+    shap_mode: str,
 ) -> dict[str, Any]:
-    return {
+    request = {
         "protocol_version": "2.0",
         "execution_id": execution_id,
         "tenant_id": "local-smoke",
@@ -331,6 +330,15 @@ def _inference_request(
         },
         "execution": {"batch_size": 64, "concurrency": 2},
     }
+    if shap_mode != "none":
+        request["extensions"] = {
+            "explanation": {
+                "enabled": True,
+                "method": "TREE_SHAP",
+                "approximate": shap_mode == "approximate",
+            }
+        }
+    return request
 
 
 def main() -> int:
@@ -376,9 +384,7 @@ def main() -> int:
             "ENGINE=MergeTree ORDER BY (execution_id, entity_id)"
         )
 
-        runtime = KnovaBrokerPlugin().create_runtime(
-            _runtime_config(args, repository)
-        )
+        runtime = KnovaBrokerPlugin().create_runtime(_runtime_config(args, repository))
         runtime.start()
         training = _training_request(
             args,
@@ -410,6 +416,7 @@ def main() -> int:
             output_table=output_table,
             bundle_uri=bundle_uri,
             password=password,
+            shap_mode=args.shap_mode,
         )
         _submit(
             runtime,
@@ -440,6 +447,23 @@ def main() -> int:
             raise RuntimeError(
                 "terminal inference event does not contain the ClickHouse row count"
             )
+        explanation_exactness = None
+        if args.shap_mode != "none":
+            pred_extra = clickhouse.query(
+                f"SELECT pred_extra FROM knova.{output_table} "
+                "WHERE execution_id = {execution_id:String} LIMIT 1",
+                parameters={"execution_id": execution_id},
+            ).first_row[0]
+            explanation = json.loads(pred_extra).get("explanation")
+            if not isinstance(explanation, dict):
+                raise RuntimeError("ClickHouse result does not contain TreeSHAP")
+            explanation_exactness = explanation.get("exactness")
+            if explanation_exactness != args.shap_mode:
+                raise RuntimeError(
+                    "ClickHouse TreeSHAP exactness does not match the request"
+                )
+            if len(explanation.get("feature_contributions", ())) != 2:
+                raise RuntimeError("ClickHouse TreeSHAP feature width is invalid")
         print(
             json.dumps(
                 {
@@ -456,6 +480,7 @@ def main() -> int:
                         "events": [event["event_type"] for event in inference_events],
                         "clickhouse_rows": result_rows,
                         "reported_rows": inference_terminal["result_rows"],
+                        "shap_exactness": explanation_exactness,
                     },
                 },
                 indent=2,
