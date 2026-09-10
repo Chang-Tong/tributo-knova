@@ -5,6 +5,7 @@ description = "KnoVa integration for Tributo"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+    "pydantic>=2.0,<3.0",
     "tributo>=1.0,<2.0",
     "tributo-broker-redis>=0.1,<1.0",
 ]
@@ -37,4 +38,3 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-
