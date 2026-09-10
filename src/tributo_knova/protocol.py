@@ -29,7 +29,7 @@ class _Request(BaseModel):
     )
 
     protocol_version: str
-    tenant_id: str = ""
+    tenant_id: str = Field(min_length=1, max_length=256)
     extensions: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("protocol_version")
@@ -47,6 +47,8 @@ class TrainingExecutionRequest(_Request):
     """KnoVa training request with a unified Python-side name."""
 
     job_id: str = Field(min_length=1, max_length=256)
+    model_id: str = Field(min_length=1, max_length=256)
+    version_id: str = Field(min_length=1, max_length=256)
     algorithm: dict[str, Any]
 
     @field_validator("job_id")
@@ -70,6 +72,7 @@ class InferenceExecutionRequest(_Request):
     """KnoVa batch-inference request."""
 
     execution_id: str = Field(min_length=1, max_length=256)
+    task_id: str = Field(min_length=1, max_length=256)
     model: dict[str, Any] | None = None
     input: dict[str, Any] | None = None
     output: dict[str, Any] | None = None

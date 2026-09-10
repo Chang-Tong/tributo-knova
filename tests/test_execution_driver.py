@@ -44,6 +44,9 @@ def _driver_input(operation_type: str = "training") -> DriverInput:
         request: dict[str, object] = {
             "protocol_version": "2.0",
             "job_id": identity,
+            "model_id": "model-1",
+            "version_id": "version-1",
+            "tenant_id": "tenant-1",
             "algorithm": {
                 "algorithm_key": "xgboost",
                 "api_token": _REQUEST_SECRET,
@@ -56,6 +59,8 @@ def _driver_input(operation_type: str = "training") -> DriverInput:
         request = {
             "protocol_version": "2.0",
             "execution_id": identity,
+            "task_id": "task-1",
+            "tenant_id": "tenant-1",
             "input": {"password": _REQUEST_SECRET},
         }
         outer_identity_field = "execution_id"

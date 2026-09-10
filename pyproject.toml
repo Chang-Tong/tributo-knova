@@ -9,7 +9,7 @@ dependencies = [
     "pydantic>=2.0,<3.0",
     "tributo @ git+https://github.com/jiangxt2/Tributo.git@8cf821a22267e4972075d576eedacf3735f3d330",
     "tributo-algorithms-boosting @ git+https://github.com/jiangxt2/tributo-algorithms.git@71a6a16c3fd3676aba2225a0c528817634927fc7#subdirectory=packages/boosting",
-    "tributo-broker-redis @ git+https://github.com/Chang-Tong/tributo-broker-redis.git@a3d0cfd676b13e09a99b3ce4b453b661744c6c44",
+    "tributo-broker-redis @ git+https://github.com/Chang-Tong/tributo-broker-redis.git@41a193b7b9215e332d82b67abf72315e99d18b45",
 ]
 
 [project.entry-points."tributo.brokers"]

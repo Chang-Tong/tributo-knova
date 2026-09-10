@@ -87,6 +87,11 @@ def _arguments() -> argparse.Namespace:
         default=os.environ.get("TRIBUTO_KNOVA_SMOKE_S3_BUCKET", "tributo-knova-smoke"),
     )
     parser.add_argument("--keep-tables", action="store_true")
+    parser.add_argument(
+        "--exercise-recovery",
+        action="store_true",
+        help="verify pending recovery and cancellation after Consumer restart",
+    )
     parser.add_argument("--timeout", type=float, default=180.0)
     return parser.parse_args()
 
@@ -236,6 +241,9 @@ def _training_request(
     return {
         "protocol_version": "2.0",
         "job_id": job_id,
+        "model_id": "local-xgboost",
+        "version_id": "v1",
+        "tenant_id": "local-smoke",
         "algorithm": {
             "algorithm_key": "xgboost",
             "hyper_params": {"n_estimators": 3, "max_depth": 3},
@@ -273,13 +281,14 @@ def _inference_request(
     execution_id: str,
     input_table: str,
     output_table: str,
-    bundle_uri: str,
+    artifact_manifest: dict[str, Any],
     password: str,
     shap_mode: str,
 ) -> dict[str, Any]:
     request = {
         "protocol_version": "2.0",
         "execution_id": execution_id,
+        "task_id": "local-smoke-task",
         "tenant_id": "local-smoke",
         "model": {
             "model_id": "local-xgboost",
@@ -288,7 +297,8 @@ def _inference_request(
             "task_type": "BINARY_CLASSIFICATION",
             "label_mapping": {"active": 0, "churn": 1},
             "positive_label_value": "churn",
-            "bundle_uri": bundle_uri,
+            "storage": artifact_manifest["storage"],
+            "model_artifacts": artifact_manifest["model_artifacts"],
         },
         "input": {
             "datasource": {
@@ -356,6 +366,14 @@ def _inference_request(
     return request
 
 
+def _bundle_uri(artifact_manifest: dict[str, Any]) -> str:
+    storage = artifact_manifest["storage"]
+    prefix = storage["prefix"].rstrip("/")
+    if storage["type"] == "s3":
+        return f"s3://{storage['bucket']}/{prefix}"
+    return str(Path(storage["bucket"]) / prefix)
+
+
 def _s3_client() -> Any:
     import boto3
     from botocore.config import Config
@@ -415,6 +433,109 @@ def _checkpoint_artifacts(storage_root: str) -> list[str]:
     return names
 
 
+def _exercise_recovery(
+    args: argparse.Namespace,
+    *,
+    runtime_config: dict[str, Any],
+    client: redis.Redis,
+    table: str,
+    storage_root: str,
+    storage_prefix: str,
+    password: str,
+    suffix: str,
+) -> dict[str, Any]:
+    task_stream = "knova:aimodel:training:distributed:tasks"
+    event_prefix = "knova:aimodel:training:distributed:events"
+    cancel_prefix = "knova:aimodel:training:distributed:cancel"
+    group = "knova-trainers"
+
+    pending_id = f"knova-pending-recovery-{suffix}"
+    pending_request = _training_request(
+        args,
+        job_id=pending_id,
+        table=table,
+        storage_root=storage_root,
+        storage_prefix=f"{storage_prefix}/pending",
+        password=password,
+    )
+    client.xadd(
+        task_stream,
+        {"job_id": pending_id, "payload": json.dumps(pending_request)},
+    )
+    claimed_by_dead_consumer = client.xreadgroup(
+        groupname=group,
+        consumername=f"dead-consumer-{suffix}",
+        streams={task_stream: ">"},
+        count=1,
+    )
+    if not claimed_by_dead_consumer:
+        raise RuntimeError("could not stage a pending Redis delivery")
+    client.set(f"{cancel_prefix}:{pending_id}", "1")
+    time.sleep(1.1)
+
+    recovered_runtime = KnovaBrokerPlugin().create_runtime(runtime_config)
+    try:
+        recovered_runtime.start()
+        if not recovered_runtime.run_once(timeout_ms=0):
+            raise RuntimeError("recovered Consumer did not process pending delivery")
+        pending_terminal, _ = _wait_terminal(
+            client,
+            stream=f"{event_prefix}:{pending_id}",
+            timeout=30,
+        )
+        if pending_terminal.get("event_type") != "CANCELLED":
+            raise RuntimeError("recovered pending task was not cancelled")
+        if client.xpending(task_stream, group)["pending"] != 0:
+            raise RuntimeError("recovered pending Redis delivery was not acknowledged")
+
+        active_id = f"knova-active-recovery-{suffix}"
+        active_request = _training_request(
+            args,
+            job_id=active_id,
+            table=table,
+            storage_root=storage_root,
+            storage_prefix=f"{storage_prefix}/active",
+            password=password,
+        )
+        active_request["algorithm"]["hyper_params"]["n_estimators"] = 100_000
+        _submit(
+            recovered_runtime,
+            client,
+            task_stream=task_stream,
+            identity_field="job_id",
+            operation_id=active_id,
+            request=active_request,
+        )
+    finally:
+        recovered_runtime.close()
+
+    restarted_runtime = KnovaBrokerPlugin().create_runtime(runtime_config)
+    try:
+        restarted_runtime.start()
+        recovered = restarted_runtime.active_submissions.get(active_id)
+        if recovered is None:
+            raise RuntimeError("running Ray job was not recovered after restart")
+        client.set(f"{cancel_prefix}:{active_id}", "1")
+        active_terminal, _ = _wait_terminal(
+            client,
+            stream=f"{event_prefix}:{active_id}",
+            timeout=120,
+        )
+        if active_terminal.get("event_type") != "CANCELLED":
+            raise RuntimeError("recovered active task was not cancelled")
+    finally:
+        restarted_runtime.close()
+        client.delete(
+            f"{cancel_prefix}:{pending_id}",
+            f"{cancel_prefix}:{active_id}",
+        )
+
+    return {
+        "pending_delivery": "recovered_and_cancelled",
+        "active_ray_job": "recovered_and_cancelled",
+    }
+
+
 def main() -> int:
     args = _arguments()
     password = os.environ.get(args.clickhouse_password_env)
@@ -463,7 +584,8 @@ def main() -> int:
             "ENGINE=MergeTree ORDER BY (execution_id, entity_id)"
         )
 
-        runtime = KnovaBrokerPlugin().create_runtime(_runtime_config(args, repository))
+        runtime_config = _runtime_config(args, repository)
+        runtime = KnovaBrokerPlugin().create_runtime(runtime_config)
         runtime.start()
         training = _training_request(
             args,
@@ -487,7 +609,18 @@ def main() -> int:
             timeout=args.timeout,
         )
         _require_success(training_terminal, job_id)
-        bundle_uri = training_terminal["training_result"]["bundle_uri"]
+        artifact_manifest = training_terminal["artifact_manifest"]
+        bundle_uri = _bundle_uri(artifact_manifest)
+        if training_terminal["result_summary"]["sample_rows"]["train"] != 300:
+            raise RuntimeError("training terminal event has an invalid row count")
+        formats = {
+            alternative["format"]
+            for alternative in artifact_manifest["model_artifacts"][
+                "model_weights"
+            ]["alternatives"]
+        }
+        if formats != {"onnx", "xgboost"}:
+            raise RuntimeError("training artifact manifest is incomplete")
         checkpoint_artifacts = _checkpoint_artifacts(storage_root)
         if args.storage_mode == "s3":
             if not bundle_uri.startswith(f"s3://{args.s3_bucket}/"):
@@ -501,7 +634,7 @@ def main() -> int:
             execution_id=execution_id,
             input_table=input_table,
             output_table=output_table,
-            bundle_uri=bundle_uri,
+            artifact_manifest=artifact_manifest,
             password=password,
             shap_mode=args.shap_mode,
         )
@@ -551,6 +684,20 @@ def main() -> int:
                 )
             if len(explanation.get("feature_contributions", ())) != 2:
                 raise RuntimeError("ClickHouse TreeSHAP feature width is invalid")
+        recovery = None
+        if args.exercise_recovery:
+            runtime.close()
+            runtime = None
+            recovery = _exercise_recovery(
+                args,
+                runtime_config=runtime_config,
+                client=redis_client,
+                table=input_table,
+                storage_root=storage_root,
+                storage_prefix=storage_prefix,
+                password=password,
+                suffix=suffix,
+            )
         print(
             json.dumps(
                 {
@@ -569,6 +716,7 @@ def main() -> int:
                         "reported_rows": inference_terminal["result_rows"],
                         "shap_exactness": explanation_exactness,
                     },
+                    "recovery": recovery,
                 },
                 indent=2,
                 sort_keys=True,

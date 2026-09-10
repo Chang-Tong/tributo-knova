@@ -14,6 +14,8 @@ def test_parse_training_request_keeps_job_id_on_the_wire() -> None:
     payload = {
         "protocol_version": "2.0",
         "job_id": "job-1",
+        "model_id": "model-1",
+        "version_id": "version-1",
         "tenant_id": "tenant-1",
         "algorithm": {"algorithm_key": "xgboost"},
         "datasource": {"type": "CLICKHOUSE", "host": "clickhouse"},
@@ -35,6 +37,7 @@ def test_parse_inference_accepts_a_higher_v2_minor() -> None:
     payload = {
         "protocol_version": "2.1",
         "execution_id": "inference-1",
+        "task_id": "task-1",
         "tenant_id": "tenant-1",
         "model": {"algorithm_key": "xgboost"},
         "input": {"expected_total_rows": 10},
@@ -74,6 +77,9 @@ def test_reject_identity_mismatch() -> None:
     payload = {
         "protocol_version": "2.0",
         "job_id": "job-inside",
+        "model_id": "model-1",
+        "version_id": "version-1",
+        "tenant_id": "tenant-1",
         "algorithm": {"algorithm_key": "xgboost"},
     }
 

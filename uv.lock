@@ -1773,7 +1773,7 @@ dependencies = [
 [[package]]
 name = "tributo-broker-redis"
 version = "0.1.0"
-source = { git = "https://github.com/Chang-Tong/tributo-broker-redis.git?rev=a3d0cfd676b13e09a99b3ce4b453b661744c6c44#a3d0cfd676b13e09a99b3ce4b453b661744c6c44" }
+source = { git = "https://github.com/Chang-Tong/tributo-broker-redis.git?rev=41a193b7b9215e332d82b67abf72315e99d18b45#41a193b7b9215e332d82b67abf72315e99d18b45" }
 dependencies = [
     { name = "packaging" },
     { name = "pydantic" },
@@ -1807,7 +1807,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6,<1.0" },
     { name = "tributo", git = "https://github.com/jiangxt2/Tributo.git?rev=8cf821a22267e4972075d576eedacf3735f3d330" },
     { name = "tributo-algorithms-boosting", git = "https://github.com/jiangxt2/tributo-algorithms.git?subdirectory=packages%2Fboosting&rev=71a6a16c3fd3676aba2225a0c528817634927fc7" },
-    { name = "tributo-broker-redis", git = "https://github.com/Chang-Tong/tributo-broker-redis.git?rev=a3d0cfd676b13e09a99b3ce4b453b661744c6c44" },
+    { name = "tributo-broker-redis", git = "https://github.com/Chang-Tong/tributo-broker-redis.git?rev=41a193b7b9215e332d82b67abf72315e99d18b45" },
 ]
 provides-extras = ["dev"]
 

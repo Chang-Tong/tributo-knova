@@ -173,16 +173,26 @@ def _artifact_alternative(
             continue
         fmt = str(raw.get("format") or "").lower()
         files = raw.get("files")
-        if fmt not in {"onnx", "ubj"} or not isinstance(files, list) or len(files) != 1:
+        if fmt not in {"onnx", "xgboost", "ubj"} or not isinstance(files, list):
             continue
-        file = files[0]
-        if isinstance(file, Mapping):
-            supported.append((raw, file))
+        expected_suffix = ".onnx" if fmt == "onnx" else ".ubj"
+        weight_files = [
+            file
+            for file in files
+            if isinstance(file, Mapping)
+            and str(file.get("path") or "").lower().endswith(expected_suffix)
+        ]
+        if len(weight_files) == 1:
+            supported.append((raw, weight_files[0]))
     if not supported:
         _invalid("model artifacts require one ONNX or UBJ weight file")
-    preferred_format = "ubj" if prefer_ubj else "onnx"
+    preferred_formats = {"xgboost", "ubj"} if prefer_ubj else {"onnx"}
     return next(
-        (item for item in supported if item[0].get("format") == preferred_format),
+        (
+            item
+            for item in supported
+            if str(item[0].get("format") or "").lower() in preferred_formats
+        ),
         supported[0],
     )
 
@@ -236,7 +246,10 @@ def _model_reference(
         )
 
     alternative, file = _artifact_alternative(model, prefer_ubj=prefer_native)
-    format_id = _text(alternative.get("format"), "model artifact format").lower()
+    protocol_format = _text(
+        alternative.get("format"), "model artifact format"
+    ).lower()
+    format_id = "ubj" if protocol_format == "xgboost" else protocol_format
     metadata = _mapping(file.get("metadata", {}), "model artifact metadata")
     input_fields, output_fields = _signature_fields(
         model,

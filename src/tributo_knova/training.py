@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import posixpath
 from collections.abc import Mapping
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
 
 from tributo.algorithms import (
     AlgorithmOperation,
@@ -18,6 +20,7 @@ from tributo.algorithms import (
 from tributo.algorithms.api import AlgorithmRunResult
 from tributo.algorithms.spi import InputExecutionContext, InputResolutionContext
 from tributo.data import IngestionRequest, ProviderSourceConfig
+from tributo.exporting import BundleRef, load_bundle
 from tributo.integrations.algorithm_inputs import (
     INGESTION_RESOLVER_ID,
     IngestionInputInvocation,
@@ -30,6 +33,9 @@ _INPUT_REFERENCE = "knova.training.input"
 _SHARED_STORAGE_TYPES = frozenset({"nfs", "nas", "shared_fs"})
 _CONTROL_HYPER_PARAMETERS = frozenset(
     {"n_estimators", "num_rounds", "objective", "num_class"}
+)
+_SENSITIVE_PROPERTY_TOKENS = frozenset(
+    {"access", "credential", "key", "password", "secret", "token"}
 )
 
 
@@ -344,6 +350,310 @@ def _build_execution(
     )
 
 
+def _safe_storage_properties(value: object) -> dict[str, str]:
+    """Keep protocol storage hints while excluding credentials and Ray-only paths."""
+    properties = _mapping(value, "storage_context.properties")
+    safe: dict[str, str] = {}
+    for raw_name, raw_value in properties.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            continue
+        name = raw_name.lower()
+        if name == "ray_storage_path" or any(
+            token in name for token in _SENSITIVE_PROPERTY_TOKENS
+        ):
+            continue
+        safe[raw_name] = raw_value
+    return safe
+
+
+def _artifact_storage(
+    request: TrainingExecutionRequest,
+    canonical_uri: str,
+) -> dict[str, Any]:
+    payload = request.model_dump(mode="python")
+    requested = _mapping(payload.get("storage_context"), "storage_context")
+    requested_type = _text(requested.get("type"), "storage_context.type").lower()
+    requested_bucket = _text(requested.get("bucket"), "storage_context.bucket")
+    requested_prefix = _relative_prefix(requested.get("prefix"))
+    properties = _safe_storage_properties(requested.get("properties", {}))
+
+    if requested_type == "s3":
+        parsed = urlsplit(canonical_uri)
+        if parsed.scheme != "s3" or parsed.netloc != requested_bucket:
+            raise _TrainingExecutionError(
+                "published Bundle is outside the requested S3 storage"
+            )
+        prefix = posixpath.normpath(parsed.path.strip("/"))
+        try:
+            contained = posixpath.commonpath([requested_prefix, prefix])
+        except ValueError as exc:
+            raise _TrainingExecutionError(
+                "published Bundle is outside the requested S3 storage"
+            ) from exc
+        if contained != requested_prefix or prefix == requested_prefix:
+            raise _TrainingExecutionError(
+                "published Bundle is outside the requested S3 storage"
+            )
+        return {
+            "type": "s3",
+            "bucket": requested_bucket,
+            "prefix": f"{prefix}/",
+            "properties": properties,
+        }
+
+    if requested_type in _SHARED_STORAGE_TYPES:
+        root = posixpath.normpath(requested_bucket)
+        requested_root = posixpath.join(root, requested_prefix)
+        bundle_path = posixpath.normpath(canonical_uri)
+        try:
+            contained = posixpath.commonpath([requested_root, bundle_path])
+        except ValueError as exc:
+            raise _TrainingExecutionError(
+                "published Bundle is outside the requested shared storage"
+            ) from exc
+        if contained != requested_root or bundle_path == requested_root:
+            raise _TrainingExecutionError(
+                "published Bundle is outside the requested shared storage"
+            )
+        return {
+            "type": "nas",
+            "bucket": root,
+            "prefix": f"{posixpath.relpath(bundle_path, root).strip('/')}/",
+            "properties": properties,
+        }
+
+    raise _TrainingExecutionError("published Bundle storage type is unsupported")
+
+
+def _signature_names(signature: object, field: str) -> list[str]:
+    if not isinstance(signature, Mapping):
+        return []
+    fields = signature.get(field.replace("_names", "_fields"), [])
+    if isinstance(fields, list):
+        names = [item.get("name") for item in fields if isinstance(item, Mapping)]
+        if names and all(isinstance(name, str) and name for name in names):
+            return list(names)
+    names = signature.get(field, [])
+    if isinstance(names, list) and all(isinstance(name, str) for name in names):
+        return list(names)
+    return []
+
+
+def _artifact_manifest(
+    request: TrainingExecutionRequest,
+    outputs: Mapping[str, Any],
+) -> dict[str, Any]:
+    bundle_id = _text(outputs.get("bundle_id"), "training output bundle_id")
+    bundle_uri = _text(outputs.get("bundle_uri"), "training output bundle_uri")
+    manifest_sha256 = _text(
+        outputs.get("manifest_sha256"), "training output manifest_sha256"
+    )
+    try:
+        bundle = load_bundle(
+            BundleRef(
+                canonical_uri=bundle_uri,
+                bundle_id=bundle_id,
+                manifest_sha256=manifest_sha256,
+            )
+        )
+    except Exception:
+        raise _TrainingExecutionError(
+            "published Bundle manifest validation failed"
+        ) from None
+
+    loaded_bundle_id = _text(bundle.get("bundle_id"), "Bundle bundle_id")
+    if loaded_bundle_id != bundle_id:
+        raise _TrainingExecutionError("published Bundle identity validation failed")
+    canonical_uri = _text(bundle.get("canonical_uri"), "Bundle canonical_uri")
+    artifacts = bundle.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise _TrainingExecutionError("published Bundle artifacts are invalid")
+
+    input_names = _signature_names(bundle.get("input_signature"), "input_names")
+    output_names = _signature_names(bundle.get("output_signature"), "output_names")
+    alternatives: list[dict[str, Any]] = []
+    total_size = 0
+    seen_formats: set[str] = set()
+    for raw_artifact in artifacts:
+        if not isinstance(raw_artifact, Mapping):
+            continue
+        bundle_format = raw_artifact.get("format")
+        if bundle_format not in {"onnx", "ubj"}:
+            continue
+        protocol_format = "xgboost" if bundle_format == "ubj" else "onnx"
+        if protocol_format in seen_formats:
+            raise _TrainingExecutionError(
+                "published Bundle has duplicate model artifact formats"
+            )
+        artifact_name = _text(raw_artifact.get("name"), "Bundle artifact name")
+        raw_files = raw_artifact.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            raise _TrainingExecutionError("published Bundle artifact files are invalid")
+        files: list[dict[str, Any]] = []
+        for raw_file in raw_files:
+            if not isinstance(raw_file, Mapping):
+                raise _TrainingExecutionError(
+                    "published Bundle artifact file is invalid"
+                )
+            relative_path = _text(
+                raw_file.get("relative_path"), "Bundle artifact relative_path"
+            )
+            sha256 = _text(raw_file.get("sha256"), "Bundle artifact sha256")
+            size = raw_file.get("size_bytes")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise _TrainingExecutionError(
+                    "published Bundle artifact size is invalid"
+                )
+            metadata: dict[str, Any] = {}
+            if protocol_format == "onnx":
+                metadata = {
+                    "input_names": input_names,
+                    "output_names": output_names,
+                }
+            elif protocol_format == "xgboost":
+                metadata = {"supports_tree_shap": True}
+            files.append(
+                {
+                    "path": posixpath.join(
+                        "artifacts", artifact_name, relative_path
+                    ),
+                    "size": size,
+                    "hash": f"sha256:{sha256}",
+                    "metadata": metadata,
+                }
+            )
+            total_size += size
+        alternatives.append({"format": protocol_format, "files": files})
+        seen_formats.add(protocol_format)
+
+    if "onnx" not in seen_formats or "xgboost" not in seen_formats:
+        raise _TrainingExecutionError(
+            "published Bundle must contain ONNX and XGBoost artifacts"
+        )
+
+    algorithm = _mapping(request.algorithm, "algorithm")
+    return {
+        "model_id": request.model_id,
+        "version_id": request.version_id,
+        "tenant_id": request.tenant_id,
+        "created_at": bundle.get("created_at"),
+        "algorithm_key": _text(
+            algorithm.get("algorithm_key"), "algorithm.algorithm_key"
+        ).lower(),
+        "storage": _artifact_storage(request, canonical_uri),
+        "model_artifacts": {
+            "model_weights": {
+                "comment": "Tributo XGBoost model Bundle",
+                "required_for_inference": True,
+                "alternatives": alternatives,
+            }
+        },
+        "total_size_bytes": total_size,
+    }
+
+
+def _training_rows(result: AlgorithmRunResult) -> int:
+    receipt = getattr(result, "execution_receipt", None)
+    if receipt is None:
+        return 0
+    return sum(worker.rows_processed or 0 for worker in receipt.workers)
+
+
+def _evaluation_metrics(result: AlgorithmRunResult) -> list[dict[str, Any]]:
+    metrics: list[dict[str, Any]] = []
+    raw_metrics = getattr(result.execution, "metrics", {})
+    if not isinstance(raw_metrics, Mapping):
+        return metrics
+    for name, value in raw_metrics.items():
+        if (
+            isinstance(name, str)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            metrics.append({"metric_name": name.lower(), "value": float(value)})
+    return sorted(metrics, key=lambda item: item["metric_name"])
+
+
+def _completed_payload(
+    request: TrainingExecutionRequest,
+    result: AlgorithmRunResult,
+) -> dict[str, Any]:
+    payload = request.model_dump(mode="python")
+    features = payload.get("features")
+    if not isinstance(features, list) or not features:
+        raise _TrainingExecutionError("training features are required")
+    target = _mapping(payload.get("target"), "target")
+    task_type = _text(target.get("task_type"), "target.task_type").upper()
+    rows = _training_rows(result)
+    metrics = _evaluation_metrics(result)
+    requested_evaluation = payload.get("evaluation")
+    primary_name = None
+    if isinstance(requested_evaluation, Mapping):
+        raw_primary = requested_evaluation.get("primary_metric")
+        if isinstance(raw_primary, str):
+            primary_name = raw_primary.lower()
+    primary_metric = next(
+        (metric for metric in metrics if metric["metric_name"] == primary_name),
+        None,
+    )
+    primary = (
+        {
+            "name": primary_metric["metric_name"],
+            "value": primary_metric["value"],
+        }
+        if primary_metric is not None
+        else None
+    )
+
+    model_features: list[dict[str, Any]] = []
+    for index, raw_feature in enumerate(features):
+        feature = _mapping(raw_feature, f"features[{index}]")
+        origin = _mapping(feature.get("origin"), f"features[{index}].origin")
+        model_features.append(
+            {
+                "model_feature_index": index,
+                "model_feature_name": _text(
+                    origin.get("column_name"),
+                    f"features[{index}].origin.column_name",
+                ),
+                "feature_id": str(feature.get("feature_id") or f"f{index + 1:03d}"),
+                "transformation": "PASSTHROUGH",
+            }
+        )
+
+    algorithm = _mapping(request.algorithm, "algorithm")
+    return {
+        "result_summary": {
+            "primary_metric": primary,
+            "sample_rows": {
+                "total": rows,
+                "train": rows,
+                "validation": 0,
+                "test": 0,
+            },
+        },
+        "training_result": {
+            "algorithm_key": _text(
+                algorithm.get("algorithm_key"), "algorithm.algorithm_key"
+            ).lower(),
+            "task_type": task_type,
+            "model_features": model_features,
+            "evaluation": {
+                "eval_type": task_type,
+                "sample_rows": 0,
+                "metrics": metrics,
+                "details": {},
+            },
+            "feature_analysis": None,
+            "tuning_result": None,
+        },
+        "artifact_manifest": _artifact_manifest(
+            request, dict(result.execution.outputs)
+        ),
+    }
+
+
 def execute_training(
     request: TrainingExecutionRequest,
     reporter: Any,
@@ -375,17 +685,9 @@ def execute_training(
         )
         if result.execution.status != "succeeded":
             raise _TrainingExecutionError("XGBoost training did not succeed")
-        outputs = dict(result.execution.outputs)
         reporter.publish(
             "COMPLETED",
-            {
-                "result_summary": {
-                    "algorithm_key": "xgboost",
-                    "status": result.execution.status,
-                    "bundle_uri": outputs.get("bundle_uri"),
-                },
-                "training_result": outputs,
-            },
+            _completed_payload(request, result),
             phase="COMPLETED",
         )
         return result

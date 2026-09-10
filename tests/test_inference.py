@@ -36,6 +36,7 @@ def _request(**updates: Any) -> InferenceExecutionRequest:
     payload: dict[str, Any] = {
         "protocol_version": "2.0",
         "execution_id": "inference-1",
+        "task_id": "task-1",
         "tenant_id": "tenant-1",
         "model": {
             "model_id": "model-1",
@@ -200,6 +201,65 @@ def test_tree_shap_keeps_onnx_prediction_and_selects_native_attribution() -> Non
     assert sink._model_reference["kind"] == "bundle"
     assert sink._model_reference["role"] == "native"
     assert sink._explanation == {"method": "TREE_SHAP", "approximate": False}
+
+
+def test_protocol_xgboost_artifact_maps_to_public_ubj_importer() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["model"].pop("bundle_uri")
+    payload["model"]["storage"] = {
+        "type": "nas",
+        "bucket": "/mnt/models",
+        "prefix": "bundle-1/",
+        "properties": {},
+    }
+    payload["model"]["model_artifacts"] = {
+        "model_weights": {
+            "alternatives": [
+                {
+                    "format": "onnx",
+                    "files": [
+                        {
+                            "path": "artifacts/onnx-model/model.onnx",
+                            "hash": "sha256:" + "a" * 64,
+                            "metadata": {},
+                        }
+                    ],
+                },
+                {
+                    "format": "xgboost",
+                    "files": [
+                        {
+                            "path": "artifacts/native-model/model.ubj",
+                            "hash": "sha256:" + "b" * 64,
+                            "metadata": {"supports_tree_shap": True},
+                        },
+                        {
+                            "path": "artifacts/native-model/feature_names.json",
+                            "hash": "sha256:" + "c" * 64,
+                            "metadata": {},
+                        },
+                    ],
+                },
+            ]
+        }
+    }
+    payload["extensions"] = {
+        "explanation": {
+            "enabled": True,
+            "method": "TREE_SHAP",
+            "approximate": False,
+        }
+    }
+
+    core, sink, _credentials = inference._build_request(
+        InferenceExecutionRequest.model_validate(payload)
+    )
+
+    assert core.model.format_id == "onnx"
+    assert sink._model_reference["format_id"] == "ubj"
+    assert sink._model_reference["uri"].endswith(
+        "/artifacts/native-model/model.ubj"
+    )
 
 
 def test_complex_query_is_rejected_without_executing_raw_sql() -> None:

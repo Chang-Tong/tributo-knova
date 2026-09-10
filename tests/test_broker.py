@@ -1,6 +1,7 @@
 import base64
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +31,8 @@ class _FakeRedis:
         self.delivered = False
         self.acked: list[tuple[str, str, str]] = []
         self.events: list[tuple[str, dict[str, str]]] = []
+        self.cancelled: set[str] = set()
+        self.claims = 0
 
     def xgroup_create(self, **_kwargs: Any) -> bool:
         return True
@@ -58,7 +61,11 @@ class _FakeRedis:
         return [("1-0", fields) for fields in reversed(entries[-count:])]
 
     def exists(self, _key: str) -> int:
-        return 0
+        return int(_key in self.cancelled)
+
+    def xautoclaim(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+        self.claims += 1
+        return ["0-0", []]
 
     def close(self) -> None:
         pass
@@ -100,6 +107,9 @@ def test_training_request_adapts_to_existing_broker_contract() -> None:
     payload = {
         "protocol_version": "2.0",
         "job_id": "job-1",
+        "model_id": "model-1",
+        "version_id": "version-1",
+        "tenant_id": "tenant-1",
         "algorithm": {"algorithm_key": "xgboost"},
         "datasource": {"type": "CLICKHOUSE", "password": "runtime-secret"},
     }
@@ -127,6 +137,8 @@ def test_request_digest_ignores_json_formatting() -> None:
     payload = {
         "protocol_version": "2.0",
         "execution_id": "inference-1",
+        "task_id": "task-1",
+        "tenant_id": "tenant-1",
     }
 
     compact = parse_broker_request(
@@ -166,6 +178,9 @@ def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
         {
             "protocol_version": "2.0",
             "job_id": "job-1",
+            "model_id": "model-1",
+            "version_id": "version-1",
+            "tenant_id": "tenant-1",
             "algorithm": {"algorithm_key": "xgboost"},
         }
     )
@@ -199,6 +214,8 @@ def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
         base64.urlsafe_b64decode(encoded).decode("utf-8")
     )
     assert driver_input.operation_payload["knova_request"]["job_id"] == "job-1"
+    assert submissions[0][1]["metadata"]["tributo.run_id"] == "job-1"
+    assert submissions[0][1]["metadata"]["tributo.attempt_id"] == "attempt-1"
     assert redis.acked == [("knova:training:tasks", "knova-training", "1-0")]
     admitted = json.loads(redis.events[-1][1]["payload"])
     assert admitted == {
@@ -209,6 +226,43 @@ def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
         "protocol_version": "2.0",
         "timestamp": admitted["timestamp"],
     }
+
+
+def test_existing_broker_runtime_honors_queued_knova_cancellation(
+    tmp_path: Path,
+) -> None:
+    core_root = tmp_path / "core"
+    (core_root / "src" / "tributo").mkdir(parents=True)
+    payload = json.dumps(
+        {
+            "protocol_version": "2.0",
+            "job_id": "job-1",
+            "model_id": "model-1",
+            "version_id": "version-1",
+            "tenant_id": "tenant-1",
+            "algorithm": {"algorithm_key": "xgboost"},
+        }
+    )
+    redis = _FakeRedis(payload)
+    redis.cancelled.add("knova:training:cancel:job-1")
+    submissions: list[str] = []
+    runtime = RedisBrokerRuntime(
+        _broker_config(core_root),
+        redis_client=redis,
+        submitter=lambda *_args, **_kwargs: submissions.append("submitted"),
+        request_parser=parse_broker_request,
+        operation_preparer=prepare_broker_operation,
+        driver_entrypoint=DRIVER_ENTRYPOINT,
+        reporter_factory=KnovaRedisEventReporter,
+    )
+
+    assert runtime.run_once(timeout_ms=0) is True
+
+    assert submissions == []
+    assert redis.acked == [("knova:training:tasks", "knova-training", "1-0")]
+    event = json.loads(redis.events[-1][1]["payload"])
+    assert event["event_type"] == "CANCELLED"
+    assert event["job_id"] == "job-1"
 
 
 def test_knova_config_identity_is_adapted_without_mutating_input() -> None:
@@ -263,3 +317,46 @@ def test_ray_failure_before_driver_emits_knova_terminal_event(tmp_path: Path) ->
     assert event["error_code"] == "RAY_JOB_FAILED"
     assert event["job_id"] == item.operation_id
     assert active.get(item.operation_id) is None
+
+
+def test_broker_start_recovers_pending_and_running_knova_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    core_root = tmp_path / "core"
+    (core_root / "src" / "tributo").mkdir(parents=True)
+    redis = _FakeRedis("{}")
+    running = SimpleNamespace(
+        status="RUNNING",
+        submission_id="submission-running",
+        job_id="ray-job-running",
+        metadata={
+            "tributo.operation_id": "job-running",
+            "tributo.operation_type": "training",
+            "tributo.execution_profile": "distributed",
+            "tributo.protocol_profile": "knova-v2",
+            "tributo.run_id": "job-running",
+            "tributo.attempt_id": "attempt-1",
+            "tributo.driver_entrypoint": DRIVER_ENTRYPOINT,
+            "tributo.task_stream": "knova:training:tasks",
+            "tributo.request_digest": "a" * 64,
+        },
+    )
+    runtime = RedisBrokerRuntime(
+        _broker_config(core_root),
+        redis_client=redis,
+        request_parser=parse_broker_request,
+        operation_preparer=prepare_broker_operation,
+        driver_entrypoint=DRIVER_ENTRYPOINT,
+        reporter_factory=KnovaRedisEventReporter,
+        job_lister=lambda _url: [running],
+    )
+    monkeypatch.setattr(runtime._cancel_watcher, "start", lambda: None)
+
+    runtime.start()
+    runtime.start()
+
+    assert redis.claims == 2
+    recovered = runtime.active_submissions.get("job-running")
+    assert recovered is not None
+    assert recovered.submission.submission_id == "submission-running"
