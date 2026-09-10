@@ -19,6 +19,10 @@ Redis consumer or create a parallel training/inference API.
 
 ## Milestone 1 — protocol and broker vertical slice
 
+Status: implemented and covered by unit tests. A remaining upstream Broker
+hardening item is to publish `FAILED` when a Ray Job exits before the driver can
+create its reporter.
+
 - Accept the current training and inference v2 envelopes. Keep `job_id` on the
   training wire while using `TrainingExecutionRequest` and `execution_id`
   consistently inside Python.
@@ -37,12 +41,19 @@ Ray driver.
 
 ## Milestone 2 — XGBoost training and artifacts
 
+Status: the public algorithm dispatcher, two-worker XGBoost execution, NFS/NAS
+storage mapping, and content-addressed Bundle publication are implemented and
+covered by the local end-to-end smoke test. S3 publication and checkpoint
+resume/failure injection remain open.
+
 - Map the existing training request to Tributo's formal algorithm execution
   contracts and use `tributo-algorithms-boosting` for distributed XGBoost.
 - Map NAS/NFS `storage_context` to Ray checkpoint storage and map final model
   storage to Tributo Bundle publication.
-- Publish `model.onnx`, `model.ubj`, `metrics.json` and a signed manifest through
-  the existing exporter/Bundle path; do not implement exporters in KnoVa.
+- Publish ONNX and UBJ model variants plus the Bundle manifest and metadata
+  through the existing exporter/Bundle path; do not implement exporters in
+  KnoVa. Add metrics only through an upstream exporter contract rather than
+  inventing a KnoVa-only file format.
 - Preserve request-digest idempotency and terminal replay behavior.
 
 Acceptance: two-worker training produces ONNX and UBJ artifacts, resumes from a
@@ -51,11 +62,17 @@ KnoVa terminal event.
 
 ## Milestone 3 — batch inference and ClickHouse
 
+Status: Ray-native ClickHouse reads, ONNX Bundle inference, protocol-v2 result
+mapping, ClickHouse writes, filter pushdown, and exact terminal row counts are
+implemented and covered by the local end-to-end smoke test. UBJ-native runtime,
+SHAP, and adaptive batch sizing remain open.
+
 - Implement a KnoVa-owned Ray-native ClickHouse ingestion Binding through
   Tributo's `tributo.ingestion_bindings` entry point.
-- Implement a ClickHouse write Binding through Tributo's
-  `tributo.write_bindings` entry point and route inference output through the
-  existing `data-write-v1` sink contract.
+- Route inference output through Tributo's existing `BoundResultSink` extension
+  point and `data-write-v1` receipt contract. The sink delegates to Ray's native
+  ClickHouse writer and keeps credentials out of the public Core request and
+  receipt.
 - Map ONNX and UBJ model references to Tributo's existing Bundle inference
   runtime. Use exact TreeSHAP where the model flavor supports it and Tributo's
   approximate explainer otherwise.
@@ -67,6 +84,10 @@ emits exact or explicitly marked approximate SHAP output, and reduces batch size
 without losing or duplicating rows when memory pressure is simulated.
 
 ## Milestone 4 — operations and release
+
+Status: a repeatable local Redis/Ray/ClickHouse smoke test exists. Container,
+systemd, health/readiness, offline packaging, and recovery/failure matrices
+remain open.
 
 - Add the consumer image, Compose example, systemd unit, health/readiness
   checks, and zstd offline image packaging.
