@@ -520,6 +520,97 @@ def test_clickhouse_requires_native_table_and_never_falls_back_to_sql(
     assert _SECRET not in str(captured.value)
 
 
+def test_clickhouse_maps_knova_simple_direct_query_to_native_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(training, "build_algorithm_dispatcher", lambda: dispatcher)
+    datasource = {
+        "type": "CLICKHOUSE",
+        "host": "clickhouse",
+        "database_name": "analytics",
+        "password": _SECRET,
+        "properties": {},
+    }
+    tables = [
+        {
+            "table_alias": "t0",
+            "database_name": "analytics",
+            "table_name": "churn_training_features",
+            "role": "PRIMARY",
+        }
+    ]
+    data_query = {
+        "mode": "DIRECT_QUERY",
+        "query": {
+            "sql": (
+                "SELECT t0.active_days AS t0__active_days, "
+                "t0.spend AS t0__spend, t0.is_churn AS t0__is_churn "
+                "FROM analytics.churn_training_features AS t0"
+            ),
+            "params": {},
+        },
+    }
+
+    training.execute_training(
+        _request(datasource=datasource, tables=tables, data_query=data_query),
+        _Reporter(),
+    )
+
+    invocation = next(iter(dispatcher.calls[0][1].values.values()))
+    assert invocation.request.source.options["table"] == (
+        "analytics.churn_training_features"
+    )
+    assert "sql" not in invocation.request.source.options
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM analytics.churn_training_features WHERE active_days > 1",
+        (
+            "SELECT * FROM analytics.churn_training_features "
+            "JOIN analytics.other USING (id)"
+        ),
+        (
+            "SELECT active_days + 1 AS t0__active_days, spend AS t0__spend, "
+            "is_churn AS t0__is_churn FROM analytics.churn_training_features"
+        ),
+    ],
+)
+def test_clickhouse_rejects_nontrivial_direct_query_without_native_table(
+    monkeypatch: pytest.MonkeyPatch, sql: str
+) -> None:
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(training, "build_algorithm_dispatcher", lambda: dispatcher)
+    datasource = {
+        "type": "CLICKHOUSE",
+        "host": "clickhouse",
+        "database_name": "analytics",
+        "password": _SECRET,
+        "properties": {},
+    }
+    tables = [
+        {
+            "database_name": "analytics",
+            "table_name": "churn_training_features",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="native_table|plain column") as captured:
+        training.execute_training(
+            _request(
+                datasource=datasource,
+                tables=tables,
+                data_query={"query": {"sql": sql, "params": {}}},
+            ),
+            _Reporter(),
+        )
+
+    assert dispatcher.calls == []
+    assert _SECRET not in str(captured.value)
+
+
 def test_dispatcher_error_is_sanitized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

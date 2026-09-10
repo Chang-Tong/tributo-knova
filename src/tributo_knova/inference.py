@@ -674,7 +674,7 @@ def _execution_policy(
     concurrency = _positive_int(
         execution.get("concurrency", options.get("max_predictor_actors")),
         "execution.concurrency",
-        4,
+        2,
     )
     return predictor_batch, sink_batch, concurrency
 
@@ -1127,7 +1127,16 @@ def execute_inference(
         raise _InferenceConfigurationError("inference request mapping failed") from None
 
     try:
-        reporter.phase("EXECUTING")
+        reporter.publish(
+            "PROGRESS",
+            {
+                "processed_rows": 0,
+                "result_rows": 0,
+                "total_rows": measured_rows,
+                "percent": 0.0,
+            },
+            phase="EXECUTING",
+        )
         retries = 0
         while True:
             with _input_environment(*input_credentials):

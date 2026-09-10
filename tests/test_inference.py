@@ -308,9 +308,15 @@ def test_execute_inference_scopes_credentials_and_reports_completion(
     assert os.environ["TRIBUTO_CLICKHOUSE_PASSWORD"] == "previous"
     assert [event[0] for event in reporter.events] == [
         "PHASE",
-        "PHASE",
+        "PROGRESS",
         "COMPLETED",
     ]
+    assert reporter.events[1][1] == {
+        "processed_rows": 0,
+        "result_rows": 0,
+        "total_rows": 7,
+        "percent": 0.0,
+    }
     assert reporter.events[-1][1]["result_summary"]["output_rows"] == 7
     assert reporter.events[-1][1]["processed_rows"] == 7
     assert reporter.events[-1][1]["result_rows"] == 7
@@ -352,6 +358,19 @@ def test_measured_rows_select_adaptive_batch_policy() -> None:
     assert core.execution.batch_size == 150_000
     assert core.execution.concurrency == 6
     assert sink._batch_size == 50_000
+
+
+def test_default_concurrency_leaves_capacity_for_ray_input_tasks() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["execution"].pop("concurrency")
+
+    core, sink, _credentials = inference._build_request(
+        InferenceExecutionRequest.model_validate(payload),
+        measured_rows=2_000,
+    )
+
+    assert core.execution.concurrency == 2
+    assert sink._concurrency == 2
 
 
 def test_memory_pressure_retries_with_smaller_batch(
@@ -396,7 +415,7 @@ def test_memory_pressure_retries_with_smaller_batch(
     assert batches == [12, 6]
     assert [event[0] for event in reporter.events] == [
         "PHASE",
-        "PHASE",
+        "PROGRESS",
         "LOG",
         "COMPLETED",
     ]

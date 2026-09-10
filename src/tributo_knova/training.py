@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import posixpath
+import re
 from collections.abc import Mapping
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
@@ -266,8 +267,8 @@ def _ingestion_invocation(
     if datasource_type != "CLICKHOUSE":
         _invalid("only datasource.type=CLICKHOUSE is supported")
     properties = _mapping(datasource.get("properties", {}), "datasource.properties")
-    native_table = _text(
-        properties.get("native_table"), "datasource.properties.native_table"
+    native_table = _native_clickhouse_table(
+        payload, properties, (*feature_names, label_name)
     )
     host = _text(datasource.get("host"), "datasource.host")
     database = _text(datasource.get("database_name"), "datasource.database_name")
@@ -306,6 +307,76 @@ def _ingestion_invocation(
             binding_id=_CLICKHOUSE_BINDING_ID,
         )
     )
+
+
+def _native_clickhouse_table(
+    payload: Mapping[str, Any],
+    properties: Mapping[str, Any],
+    required_columns: tuple[str, ...],
+) -> str:
+    """Resolve KnoVa's simple DIRECT_QUERY shape to a native Ray table read."""
+    configured = properties.get("native_table")
+    if configured is not None:
+        return _text(configured, "datasource.properties.native_table")
+
+    tables = payload.get("tables")
+    data_query = payload.get("data_query")
+    if not isinstance(tables, list) or len(tables) != 1 or not isinstance(
+        data_query, Mapping
+    ):
+        _invalid(
+            "datasource.properties.native_table is required unless data_query "
+            "is a simple single-table projection"
+        )
+
+    table = _mapping(tables[0], "tables[0]")
+    database = _text(table.get("database_name"), "tables[0].database_name")
+    table_name = _text(table.get("table_name"), "tables[0].table_name")
+    query = _mapping(data_query.get("query"), "data_query.query")
+    sql = _text(query.get("sql"), "data_query.query.sql")
+    params = _mapping(query.get("params", {}), "data_query.query.params")
+    if params:
+        _invalid(
+            "datasource.properties.native_table is required for parameterized queries"
+        )
+
+    identifier = r"`?[A-Za-z_][A-Za-z0-9_]*`?"
+    match = re.fullmatch(
+        rf"(?is)\s*select\s+(.+?)\s+from\s+"
+        rf"({identifier}(?:\.{identifier})?)"
+        rf"(?:\s+(?:as\s+)?({identifier}))?\s*;?\s*",
+        sql,
+    )
+    source_name = match.group(2).replace("`", "") if match else None
+    qualified = f"{database}.{table_name}"
+    if source_name not in {table_name, qualified}:
+        _invalid(
+            "datasource.properties.native_table is required unless data_query "
+            "is a simple single-table projection"
+        )
+
+    assert match is not None
+    table_alias = match.group(3)
+    if table_alias is not None:
+        table_alias = table_alias.replace("`", "")
+    projected_columns: list[str] = []
+    for item in match.group(1).split(","):
+        projection = re.fullmatch(
+            rf"(?is)\s*(?:({identifier})\.)?({identifier})\s+as\s+"
+            rf"{identifier}\s*",
+            item,
+        )
+        if projection is None:
+            _invalid("data_query must contain plain column projections only")
+        projection_alias = projection.group(1)
+        if projection_alias is not None:
+            projection_alias = projection_alias.replace("`", "")
+        if table_alias is not None and projection_alias not in {None, table_alias}:
+            _invalid("data_query projection alias does not match its source table")
+        projected_columns.append(projection.group(2).replace("`", ""))
+    if tuple(projected_columns) != required_columns:
+        _invalid("data_query columns do not match the requested features and target")
+    return qualified
 
 
 def _build_execution(
