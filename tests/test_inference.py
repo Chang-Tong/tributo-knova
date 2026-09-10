@@ -217,6 +217,7 @@ def test_execute_inference_scopes_credentials_and_reports_completion(
         return Result()
 
     monkeypatch.setattr(inference, "run_inference", run)
+    monkeypatch.setattr(inference, "_measure_input_rows", lambda *_args: 7)
 
     result = inference.execute_inference(_request(), reporter)
 
@@ -239,11 +240,84 @@ def test_execution_error_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
         raise RuntimeError(_SECRET)
 
     monkeypatch.setattr(inference, "run_inference", fail)
+    monkeypatch.setattr(inference, "_measure_input_rows", lambda *_args: 1)
 
     with pytest.raises(RuntimeError) as captured:
         inference.execute_inference(_request(), _Reporter())
 
     assert _SECRET not in str(captured.value)
+
+
+def test_measured_rows_select_adaptive_batch_policy() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["extensions"] = {
+        "tributo": {
+            "inference_runtime": {
+                "adaptive_target_batches": 20,
+                "adaptive_min_batch_size": 50_000,
+                "adaptive_max_batch_size": 1_000_000,
+                "max_predictor_actors": 6,
+            }
+        }
+    }
+    payload["execution"].pop("concurrency")
+
+    core, sink, _credentials = inference._build_request(
+        InferenceExecutionRequest.model_validate(payload),
+        measured_rows=3_000_000,
+    )
+
+    assert core.execution.batch_size == 150_000
+    assert core.execution.concurrency == 6
+    assert sink._batch_size == 50_000
+
+
+def test_memory_pressure_retries_with_smaller_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reporter = _Reporter()
+    batches: list[int] = []
+
+    class Result:
+        def __init__(self, *, succeeded: bool) -> None:
+            self.status = "succeeded" if succeeded else "failed"
+            self.failure = (
+                None
+                if succeeded
+                else SimpleNamespace(
+                    phase="materialization",
+                    error_type="OutOfMemoryError",
+                )
+            )
+            self.output_rows = 12 if succeeded else None
+            self.sink_receipt = (
+                SimpleNamespace(uri="clickhouse://clickhouse:8123/analytics.out")
+                if succeeded
+                else None
+            )
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            assert mode == "json"
+            return {"status": self.status, "output_rows": self.output_rows}
+
+    def run(core: Any, *, bound_sink: Any) -> Result:
+        del bound_sink
+        batches.append(core.execution.batch_size)
+        return Result(succeeded=len(batches) > 1)
+
+    monkeypatch.setattr(inference, "run_inference", run)
+    monkeypatch.setattr(inference, "_measure_input_rows", lambda *_args: 12)
+
+    result = inference.execute_inference(_request(), reporter)
+
+    assert result.status == "succeeded"
+    assert batches == [12, 6]
+    assert [event[0] for event in reporter.events] == [
+        "PHASE",
+        "PHASE",
+        "LOG",
+        "COMPLETED",
+    ]
 
 
 def test_protocol_batch_maps_binary_result_schema() -> None:

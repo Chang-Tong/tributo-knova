@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -20,6 +21,7 @@ from tributo.data import (
     ProviderSourceConfig,
     TransformPipeline,
 )
+from tributo.exceptions import ResultMaterializationError, ResultWriteError
 from tributo.inference import (
     ArtifactModelReference,
     BundleModelReference,
@@ -57,6 +59,10 @@ _UNSUPPORTED_SQL = re.compile(
     re.IGNORECASE,
 )
 _SHARED_STORAGE_TYPES = frozenset({"nfs", "nas", "shared_fs"})
+_MEMORY_PRESSURE_ERRORS = frozenset(
+    {"MemoryError", "OutOfMemoryError", "RayActorError", "RayOutOfMemoryError"}
+)
+_MAX_ADAPTIVE_RETRIES = 3
 
 
 class _InferenceConfigurationError(ValueError):
@@ -408,6 +414,9 @@ def _output_bindings(model: Mapping[str, Any]) -> tuple[TensorOutputBinding, ...
 
 def _build_request(
     request: InferenceExecutionRequest,
+    *,
+    measured_rows: int | None = None,
+    batch_size_override: int | None = None,
 ) -> tuple[InferenceRequest, _ClickHouseResultSink, tuple[str, str]]:
     payload = request.model_dump(mode="python")
     model = _mapping(payload.get("model"), "model")
@@ -434,12 +443,10 @@ def _build_request(
             (entity_column, *features, *(step.column for step in transforms.steps))
         )
     )
-    execution = _mapping(payload.get("execution", {}), "execution")
-    batch_size = _positive_int(
-        execution.get("batch_size"), "execution.batch_size", 4096
-    )
-    concurrency = _positive_int(
-        execution.get("concurrency"), "execution.concurrency", 4
+    batch_size, sink_batch_size, concurrency = _execution_policy(
+        payload,
+        measured_rows=measured_rows,
+        batch_size_override=batch_size_override,
     )
     source = ProviderSourceConfig(
         provider="tributo.clickhouse",
@@ -546,9 +553,123 @@ def _build_request(
         entity_column=entity_column,
         feature_columns=features,
         feature_result_names=result_names,
-        batch_size=batch_size,
+        batch_size=sink_batch_size,
     )
     return core_request, sink, (username, password)
+
+
+def _execution_policy(
+    payload: Mapping[str, Any],
+    *,
+    measured_rows: int | None,
+    batch_size_override: int | None,
+) -> tuple[int, int, int]:
+    execution = _mapping(payload.get("execution", {}), "execution")
+    extensions = payload.get("extensions")
+    tributo = extensions.get("tributo") if isinstance(extensions, Mapping) else None
+    runtime = (
+        tributo.get("inference_runtime") if isinstance(tributo, Mapping) else None
+    )
+    options = runtime if isinstance(runtime, Mapping) else {}
+    target_batches = _positive_int(
+        options.get("adaptive_target_batches"),
+        "extensions.tributo.inference_runtime.adaptive_target_batches",
+        20,
+    )
+    minimum = _positive_int(
+        options.get("adaptive_min_batch_size"),
+        "extensions.tributo.inference_runtime.adaptive_min_batch_size",
+        50_000,
+    )
+    maximum = _positive_int(
+        options.get("adaptive_max_batch_size"),
+        "extensions.tributo.inference_runtime.adaptive_max_batch_size",
+        1_000_000,
+    )
+    if minimum > maximum:
+        _invalid("adaptive_min_batch_size must not exceed adaptive_max_batch_size")
+
+    if batch_size_override is not None:
+        base = _positive_int(batch_size_override, "adaptive batch override", 1)
+    elif measured_rows is not None and measured_rows > 0:
+        base = min(
+            measured_rows,
+            max(minimum, math.ceil(measured_rows / target_batches)),
+            maximum,
+        )
+    else:
+        base = _positive_int(
+            execution.get("batch_size"), "execution.batch_size", 4096
+        )
+    predictor_batch = _positive_int(
+        options.get("predictor_batch_size"),
+        "extensions.tributo.inference_runtime.predictor_batch_size",
+        base,
+    )
+    sink_batch = _positive_int(
+        options.get("sink_batch_size"),
+        "extensions.tributo.inference_runtime.sink_batch_size",
+        min(base, minimum, 50_000),
+    )
+    concurrency = _positive_int(
+        execution.get("concurrency", options.get("max_predictor_actors")),
+        "execution.concurrency",
+        4,
+    )
+    return predictor_batch, sink_batch, concurrency
+
+
+def _parameter_type(value: object) -> str:
+    if isinstance(value, bool):
+        return "UInt8"
+    if isinstance(value, int):
+        return "Int64"
+    if isinstance(value, float):
+        return "Float64"
+    if isinstance(value, str):
+        return "String"
+    _invalid("input.query equality parameters must be scalar JSON values")
+
+
+def _measure_input_rows(
+    request: InferenceRequest,
+    credentials: tuple[str, str],
+) -> int:
+    import clickhouse_connect
+
+    source = request.input.source
+    options = source.options
+    table = _text(options.get("table"), "input ClickHouse table")
+    host = _text(options.get("host"), "input ClickHouse host")
+    port = _positive_int(options.get("port"), "input ClickHouse port", 8123)
+    database = _text(options.get("database"), "input ClickHouse database")
+    clauses: list[str] = []
+    parameters: dict[str, object] = {}
+    for index, step in enumerate(request.input.transforms.steps):
+        if not isinstance(step, FilterEq):
+            _invalid("adaptive row counting supports equality filters only")
+        name = f"filter_{index}"
+        column = _identifier(step.column, "input query filter column")
+        clauses.append(f"`{column}` = {{{name}:{_parameter_type(step.value)}}}")
+        parameters[name] = step.value
+    sql = f"SELECT count() FROM {table}"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        database=database,
+        username=credentials[0],
+        password=credentials[1],
+    )
+    try:
+        return int(client.query(sql, parameters=parameters).first_row[0])
+    except Exception as exc:
+        raise _InferenceExecutionError(
+            f"input row count failed ({type(exc).__name__})"
+        ) from None
+    finally:
+        client.close()
 
 
 def _json_value(value: Any) -> Any:
@@ -713,22 +834,30 @@ class _ClickHouseResultSink:
                 "feature_result_names": self._feature_result_names,
             },
         )
-        transformed = transformed.materialize()
-        rows_written = transformed.count()
+        try:
+            transformed = transformed.materialize()
+            rows_written = transformed.count()
+        except Exception as exc:
+            raise ResultMaterializationError(type(exc).__name__) from None
         import ray.data
 
-        transformed.write_clickhouse(
-            table=self._table,
-            dsn=_dsn(
-                host=self._host,
-                port=self._port,
-                database=self._database,
-                user=self._username,
-                password=self._password,
-            ),
-            mode=ray.data.SinkMode.APPEND,
-            max_insert_block_rows=self._batch_size,
-        )
+        try:
+            transformed.write_clickhouse(
+                table=self._table,
+                dsn=_dsn(
+                    host=self._host,
+                    port=self._port,
+                    database=self._database,
+                    user=self._username,
+                    password=self._password,
+                ),
+                mode=ray.data.SinkMode.APPEND,
+                max_insert_block_rows=self._batch_size,
+            )
+        except Exception as exc:
+            raise ResultWriteError(
+                f"ClickHouse result write failed ({type(exc).__name__})"
+            ) from None
         result_id = hashlib.sha256(
             f"{run_id}|{plan_digest}|{self._table}".encode()
         ).hexdigest()
@@ -747,17 +876,52 @@ def execute_inference(
 ) -> Any:
     """Execute one KnoVa batch request through Tributo's public inference API."""
     try:
-        core_request, sink, input_credentials = _build_request(request)
+        reporter.phase("PREPARING")
+        initial_request, _initial_sink, input_credentials = _build_request(request)
+        measured_rows = _measure_input_rows(initial_request, input_credentials)
+        core_request, sink, input_credentials = _build_request(
+            request,
+            measured_rows=measured_rows,
+        )
     except _InferenceConfigurationError:
         raise
     except Exception:
         raise _InferenceConfigurationError("inference request mapping failed") from None
 
     try:
-        reporter.phase("PREPARING")
         reporter.phase("EXECUTING")
-        with _input_environment(*input_credentials):
-            result = run_inference(core_request, bound_sink=sink)
+        retries = 0
+        while True:
+            with _input_environment(*input_credentials):
+                result = run_inference(core_request, bound_sink=sink)
+            failure = result.failure
+            if (
+                result.status == "failed"
+                and failure is not None
+                and failure.phase == "materialization"
+                and failure.error_type in _MEMORY_PRESSURE_ERRORS
+                and core_request.execution.batch_size > 1
+                and retries < _MAX_ADAPTIVE_RETRIES
+            ):
+                retries += 1
+                next_batch = max(1, core_request.execution.batch_size // 2)
+                reporter.publish(
+                    "LOG",
+                    {
+                        "message": (
+                            "Memory pressure detected; retrying inference with "
+                            f"batch_size={next_batch}"
+                        )
+                    },
+                    phase="EXECUTING",
+                )
+                core_request, sink, input_credentials = _build_request(
+                    request,
+                    measured_rows=measured_rows,
+                    batch_size_override=next_batch,
+                )
+                continue
+            break
         if result.status != "succeeded":
             failure_type = (
                 result.failure.error_type if result.failure else "InferenceFailed"
@@ -768,9 +932,9 @@ def execute_inference(
         reporter.publish(
             "COMPLETED",
             {
-                "processed_rows": result.output_rows or 0,
+                "processed_rows": measured_rows,
                 "result_rows": result.output_rows or 0,
-                "total_rows": result.output_rows or 0,
+                "total_rows": measured_rows,
                 "result_summary": {
                     "status": result.status,
                     "output_rows": result.output_rows,

@@ -18,7 +18,7 @@ owned by `tributo-broker-redis`.
 See [the implementation plan](docs/implementation-plan.md) for the completed
 vertical slices and the remaining release work. This branch is not a 1.0
 release yet: S3 publication, checkpoint-resume testing, UBJ-native inference,
-SHAP, adaptive batching, and production deployment assets remain open.
+SHAP, and production deployment assets remain open.
 
 ## Development
 
