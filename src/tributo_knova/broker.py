@@ -15,6 +15,7 @@ from tributo_broker_redis.protocol import GenericRequest
 from tributo_broker_redis.runtime import RedisBrokerRuntime
 
 from tributo_knova.protocol import parse_request
+from tributo_knova.reporter import KnovaRedisEventReporter
 
 DRIVER_ENTRYPOINT = "python -m tributo_knova.execution_driver"
 
@@ -94,6 +95,7 @@ class KnovaBrokerPlugin(BrokerPlugin):
             request_parser=parse_broker_request,
             operation_preparer=prepare_broker_operation,
             driver_entrypoint=DRIVER_ENTRYPOINT,
+            reporter_factory=KnovaRedisEventReporter,
         )
 
 

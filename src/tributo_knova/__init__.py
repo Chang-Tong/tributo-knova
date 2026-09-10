@@ -7,10 +7,12 @@ from tributo_knova.protocol import (
     TrainingExecutionRequest,
     parse_request,
 )
+from tributo_knova.reporter import KnovaRedisEventReporter
 
 __all__ = [
     "InferenceExecutionRequest",
     "KnovaBrokerPlugin",
+    "KnovaRedisEventReporter",
     "KnovaProtocolFailure",
     "TrainingExecutionRequest",
     "parse_request",

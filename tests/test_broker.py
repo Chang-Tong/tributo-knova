@@ -15,6 +15,7 @@ from tributo_knova.broker import (
     parse_broker_request,
     prepare_broker_operation,
 )
+from tributo_knova.reporter import KnovaRedisEventReporter
 
 
 class _FakeRedis:
@@ -178,6 +179,7 @@ def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
         request_parser=parse_broker_request,
         operation_preparer=prepare_broker_operation,
         driver_entrypoint=DRIVER_ENTRYPOINT,
+        reporter_factory=KnovaRedisEventReporter,
     )
 
     assert runtime.run_once(timeout_ms=0) is True
@@ -188,3 +190,12 @@ def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
     )
     assert driver_input.operation_payload["knova_request"]["job_id"] == "job-1"
     assert redis.acked == [("knova:training:tasks", "knova-training", "1-0")]
+    admitted = json.loads(redis.events[-1][1]["payload"])
+    assert admitted == {
+        "event_type": "PHASE",
+        "job_id": "job-1",
+        "message": "Ray job admitted",
+        "phase": "QUEUED",
+        "protocol_version": "2.0",
+        "timestamp": admitted["timestamp"],
+    }
