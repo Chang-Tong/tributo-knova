@@ -19,9 +19,10 @@ Redis consumer or create a parallel training/inference API.
 
 ## Milestone 1 — protocol and broker vertical slice
 
-Status: implemented and covered by unit tests. A remaining upstream Broker
-hardening item is to publish `FAILED` when a Ray Job exits before the driver can
-create its reporter.
+Status: implemented and covered by unit tests. The imported Broker watchdog now
+publishes `FAILED` when a Ray Job exits before the driver can create its
+reporter; the KnoVa adapter verifies that this uses the protocol-v2 terminal
+envelope.
 
 - Accept the current training and inference v2 envelopes. Keep `job_id` on the
   training wire while using `TrainingExecutionRequest` and `execution_id`

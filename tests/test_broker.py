@@ -5,6 +5,11 @@ from typing import Any
 
 import pytest
 from tributo.ray_jobs import RayJobSubmission
+from tributo_broker_redis.cancellation import (
+    ActiveSubmission,
+    ActiveSubmissionMap,
+    CancelWatcher,
+)
 from tributo_broker_redis.config import RedisBrokerConfig
 from tributo_broker_redis.operations import MappingFailure
 from tributo_broker_redis.protocol import DriverInput, GenericRequest
@@ -47,6 +52,10 @@ class _FakeRedis:
     def xadd(self, stream: str, fields: dict[str, str], **_kwargs: Any) -> str:
         self.events.append((stream, fields))
         return "1-0"
+
+    def xrevrange(self, stream: str, *, count: int) -> list[Any]:
+        entries = [fields for name, fields in self.events if name == stream]
+        return [("1-0", fields) for fields in reversed(entries[-count:])]
 
     def exists(self, _key: str) -> int:
         return 0
@@ -214,3 +223,43 @@ def test_knova_config_identity_is_adapted_without_mutating_input() -> None:
 def test_foreign_broker_identity_is_rejected() -> None:
     with pytest.raises(ValueError, match="broker_id must be tributo-knova"):
         _redis_broker_config({"broker_id": "other"})
+
+
+def test_ray_failure_before_driver_emits_knova_terminal_event(tmp_path: Path) -> None:
+    core_root = tmp_path / "core"
+    (core_root / "src" / "tributo").mkdir(parents=True)
+    config = _broker_config(core_root)
+    redis = _FakeRedis("{}")
+    submission = RayJobSubmission(
+        run_id="job-before-driver",
+        attempt_id="attempt-1",
+        submission_id="submission-before-driver",
+    )
+    item = ActiveSubmission(
+        operation_id="job-before-driver",
+        operation_type="training",
+        execution_profile="distributed",
+        run_id=submission.run_id,
+        channel=config.channels.training,
+        submission=submission,
+    )
+    active = ActiveSubmissionMap()
+    active.put(item)
+    watcher = CancelWatcher(
+        redis,
+        active,
+        dashboard_url="http://ray:8265",
+        interval_seconds=1,
+        max_event_bytes=1024 * 1024,
+        max_stream_length=100,
+        status_getter=lambda *_args, **_kwargs: "FAILED",
+        reporter_factory=KnovaRedisEventReporter,
+    )
+
+    watcher.check_once()
+
+    event = json.loads(redis.events[-1][1]["payload"])
+    assert event["event_type"] == "FAILED"
+    assert event["error_code"] == "RAY_JOB_FAILED"
+    assert event["job_id"] == item.operation_id
+    assert active.get(item.operation_id) is None

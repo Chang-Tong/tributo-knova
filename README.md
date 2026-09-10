@@ -23,7 +23,9 @@ SHAP, adaptive batching, and production deployment assets remain open.
 ## Development
 
 The local development configuration resolves both dependencies from sibling
-repositories:
+repositories during the smoke test. Normal installation uses immutable Git
+commits for Tributo, the Redis Broker, and the official boosting package until
+compatible releases are published:
 
 ```bash
 uv sync --extra dev
