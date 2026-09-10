@@ -13,6 +13,11 @@ Redis Streams consumption, consumer groups, pending recovery, cancellation,
 Ray Job admission, retries, and acknowledgements remain owned by
 `tributo-broker-redis`.
 
+See [the implementation plan](docs/implementation-plan.md) for the four
+milestones. The current branch completes the request/admission/event boundary;
+the KnoVa training and inference Ray driver is the next vertical slice and is
+not release-ready yet.
+
 ## Development
 
 The local development configuration resolves both dependencies from sibling
