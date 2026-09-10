@@ -18,8 +18,10 @@ from tributo.exceptions import JobConfigurationError
 
 from tributo_knova.clickhouse import (
     RayClickHouseBinding,
+    _discover_sorting_key,
     _dsn,
     _qualified_table,
+    _simple_sorting_key_columns,
     clickhouse_binding_descriptor,
 )
 
@@ -129,6 +131,75 @@ def test_binding_delegates_structured_read_to_ray(
     ]
 
 
+def test_auto_sharding_discovers_clickhouse_sorting_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    dataset = _Dataset()
+
+    monkeypatch.setattr(
+        "tributo_knova.clickhouse._discover_sorting_key",
+        lambda **_kwargs: (["user_id"], False),
+    )
+    monkeypatch.setattr(
+        "ray.data.read_clickhouse",
+        lambda **kwargs: calls.append(kwargs) or dataset,
+    )
+
+    result = RayClickHouseBinding().compile(_request())
+
+    assert calls[0]["order_by"] == (["user_id"], False)
+    assert "order key enables Ray parallel read tasks" in result.diagnostics[0]
+
+
+def test_sorting_key_metadata_uses_bound_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    class _Result:
+        result_rows = [("tenant_id, event_time, user_id",)]
+
+    class _Client:
+        def query(self, query: str, *, parameters: dict[str, str]) -> _Result:
+            observed["query"] = query
+            observed["parameters"] = parameters
+            return _Result()
+
+        def close(self) -> None:
+            observed["closed"] = True
+
+    monkeypatch.setattr("clickhouse_connect.get_client", lambda **_kwargs: _Client())
+
+    order_by = _discover_sorting_key(
+        dsn="clickhouse+http://host:8123/analytics",
+        qualified_table="analytics.training_features",
+    )
+
+    assert order_by == (["tenant_id", "event_time", "user_id"], False)
+    assert observed["parameters"] == {
+        "database": "analytics",
+        "table": "training_features",
+    }
+    assert observed["closed"] is True
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("tenant_id, event_time, user_id", ["tenant_id", "event_time", "user_id"]),
+        ("event_date, `table`, event_time", ["event_date", "`table`", "event_time"]),
+        ("toDate(event_time), user_id", None),
+        ("tuple()", None),
+    ],
+)
+def test_sorting_key_parser_preserves_composite_key_order(
+    expression: str,
+    expected: list[str] | None,
+) -> None:
+    assert _simple_sorting_key_columns(expression) == expected
+
+
 def test_binding_failure_does_not_include_clickhouse_password(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -138,6 +209,10 @@ def test_binding_failure_does_not_include_clickhouse_password(
         ray.data,
         "read_clickhouse",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("p@ss/word")),
+    )
+    monkeypatch.setattr(
+        "tributo_knova.clickhouse._discover_sorting_key",
+        lambda **_kwargs: None,
     )
 
     with pytest.raises(Exception) as captured:

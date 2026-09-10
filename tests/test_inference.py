@@ -124,8 +124,7 @@ def test_build_request_uses_public_inference_contract_without_credentials() -> N
         "stat_month",
     ]
     assert core.input.source.options["partitioning"] == {
-        "mode": "parallel",
-        "column": "user_id",
+        "mode": "auto",
         "num_partitions": 3,
     }
     assert core.input.transforms.steps[0].column == "stat_month"

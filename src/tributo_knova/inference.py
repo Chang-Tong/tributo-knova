@@ -246,9 +246,7 @@ def _model_reference(
         )
 
     alternative, file = _artifact_alternative(model, prefer_ubj=prefer_native)
-    protocol_format = _text(
-        alternative.get("format"), "model artifact format"
-    ).lower()
+    protocol_format = _text(alternative.get("format"), "model artifact format").lower()
     format_id = "ubj" if protocol_format == "xgboost" else protocol_format
     metadata = _mapping(file.get("metadata", {}), "model artifact metadata")
     input_fields, output_fields = _signature_fields(
@@ -505,8 +503,7 @@ def _build_request(
             "database": database,
             "columns": columns,
             "partitioning": {
-                "mode": "parallel",
-                "column": entity_column,
+                "mode": "auto",
                 "num_partitions": concurrency,
             },
         },
