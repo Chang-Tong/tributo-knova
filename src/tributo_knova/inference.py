@@ -19,6 +19,7 @@ from tributo.data import (
     FilterEq,
     IngestionRequest,
     ProviderSourceConfig,
+    ReadOptions,
     TransformPipeline,
 )
 from tributo.exceptions import ResultMaterializationError, ResultWriteError
@@ -63,6 +64,7 @@ _MEMORY_PRESSURE_ERRORS = frozenset(
     {"MemoryError", "OutOfMemoryError", "RayActorError", "RayOutOfMemoryError"}
 )
 _MAX_ADAPTIVE_RETRIES = 3
+_CLICKHOUSE_READ_TASK_ROWS = 200_000
 
 
 class _InferenceConfigurationError(ValueError):
@@ -493,6 +495,12 @@ def _build_request(
         measured_rows=measured_rows,
         batch_size_override=batch_size_override,
     )
+    read_partitions = concurrency
+    if measured_rows is not None and measured_rows > 0:
+        read_partitions = max(
+            concurrency,
+            math.ceil(measured_rows / _CLICKHOUSE_READ_TASK_ROWS),
+        )
     source = ProviderSourceConfig(
         provider="tributo.clickhouse",
         uri=f"clickhouse://{host}:{port}/{database}",
@@ -504,7 +512,7 @@ def _build_request(
             "columns": columns,
             "partitioning": {
                 "mode": "auto",
-                "num_partitions": concurrency,
+                "num_partitions": read_partitions,
             },
         },
     )
@@ -578,6 +586,10 @@ def _build_request(
             engine="ray",
             binding_id=_CLICKHOUSE_BINDING_ID,
             transforms=transforms,
+            read_options=ReadOptions(
+                batch_size=_CLICKHOUSE_READ_TASK_ROWS,
+                concurrency=concurrency,
+            ),
         ),
         input_binding=InputBindingSpec(
             tensors=(
@@ -643,7 +655,7 @@ def _execution_policy(
     maximum = _positive_int(
         options.get("adaptive_max_batch_size"),
         "extensions.tributo.inference_runtime.adaptive_max_batch_size",
-        1_000_000,
+        200_000,
     )
     if minimum > maximum:
         _invalid("adaptive_min_batch_size must not exceed adaptive_max_batch_size")

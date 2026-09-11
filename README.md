@@ -33,13 +33,17 @@ For Tributo `auto` partitioning, this package reads
 `system.tables.sorting_key` and passes every simple sorting-key column to Ray in
 its original order. A composite key such as `tenant_id, event_time, user_id`
 therefore becomes `order_by=(["tenant_id", "event_time", "user_id"], False)`.
-Ray then owns block sizing, read-task scheduling, and execution.
+Ray then owns block sizing, read-task scheduling, and execution. For inference,
+KnoVa asks Ray for enough ordered read tasks to keep each task at or below
+200,000 rows. Completed tasks flow through Ray's native backpressure into the
+inference actor pool, whose default adaptive batch size is also capped at
+200,000 rows.
 
 Sorting-key SQL expressions are not passed through as arbitrary SQL. If the key
 contains an expression such as `toDate(event_time)`, or metadata access is not
-available, the Binding retains Ray's safe single-task fallback. Inference may
-set a bounded target block count through Tributo's existing `auto`
-partitioning; it does not introduce a KnoVa-specific read API.
+available, the Binding retains Ray's safe single-task fallback and emits a
+single-worker memory-risk warning. KnoVa does not introduce a parallel reader
+without a deterministic key because that could duplicate or omit rows.
 
 ## Development
 

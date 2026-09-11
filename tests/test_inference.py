@@ -127,6 +127,8 @@ def test_build_request_uses_public_inference_contract_without_credentials() -> N
         "mode": "auto",
         "num_partitions": 3,
     }
+    assert core.input.read_options.batch_size == 200_000
+    assert core.input.read_options.concurrency == 3
     assert core.input.transforms.steps[0].column == "stat_month"
     assert core.input.transforms.steps[0].value == "202601"
     assert core.input_binding.tensors[0].columns == ("spend", "active_days")
@@ -356,6 +358,7 @@ def test_measured_rows_select_adaptive_batch_policy() -> None:
 
     assert core.execution.batch_size == 150_000
     assert core.execution.concurrency == 6
+    assert core.input.source.options["partitioning"]["num_partitions"] == 15
     assert sink._batch_size == 50_000
 
 
@@ -370,6 +373,17 @@ def test_default_concurrency_leaves_capacity_for_ray_input_tasks() -> None:
 
     assert core.execution.concurrency == 2
     assert sink._concurrency == 2
+
+
+def test_default_adaptive_batch_and_read_tasks_are_capped_at_200k_rows() -> None:
+    core, _sink, _credentials = inference._build_request(
+        _request(),
+        measured_rows=10_000_000,
+    )
+
+    assert core.execution.batch_size == 200_000
+    assert core.input.source.options["partitioning"]["num_partitions"] == 50
+    assert core.input.read_options.batch_size == 200_000
 
 
 def test_memory_pressure_retries_with_smaller_batch(
