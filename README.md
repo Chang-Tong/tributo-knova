@@ -12,16 +12,34 @@ batch-inference envelopes and adapts them to the public Redis broker runtime.
 It provides distributed XGBoost training, content-addressed Tributo Bundles,
 Ray-native ClickHouse input, Bundle inference, ClickHouse result output, and
 exact or explicitly approximate per-row TreeSHAP output through the official
-XGBoost UBJ flavor, plus KnoVa v2 lifecycle events. Redis Streams consumption,
-consumer groups, pending recovery, cancellation, Ray Job admission, retries,
-and acknowledgements remain owned by `tributo-broker-redis`.
+XGBoost UBJ flavor, split-aware terminal evaluation, live round metrics,
+feature importance, and distributed feature correlation, plus KnoVa v2
+lifecycle events. Redis Streams consumption, consumer groups, pending recovery,
+cancellation, Ray Job admission, retries, and acknowledgements remain owned by
+`tributo-broker-redis`.
 
 See [the implementation plan](docs/implementation-plan.md) for the completed
 vertical slices and the remaining upstream limits. See the
 [verification matrix](docs/verification-matrix.md) for the tested paths. This
 branch is not a 1.0 release yet: cross-restart checkpoint resume, direct
-UBJ-only prediction, terminal evaluation generation, and compatible upstream
-release tags remain open.
+UBJ-only prediction, and compatible upstream release tags remain open.
+
+## ClickHouse parallel reads
+
+Training and inference share one Tributo ingestion Binding backed by
+`ray.data.read_clickhouse`. Ray reads row-count, byte-size, sample-schema, and
+sample-block metadata, but it does not discover a deterministic ordering key.
+For Tributo `auto` partitioning, this package reads
+`system.tables.sorting_key` and passes every simple sorting-key column to Ray in
+its original order. A composite key such as `tenant_id, event_time, user_id`
+therefore becomes `order_by=(["tenant_id", "event_time", "user_id"], False)`.
+Ray then owns block sizing, read-task scheduling, and execution.
+
+Sorting-key SQL expressions are not passed through as arbitrary SQL. If the key
+contains an expression such as `toDate(event_time)`, or metadata access is not
+available, the Binding retains Ray's safe single-task fallback. Inference may
+set a bounded target block count through Tributo's existing `auto`
+partitioning; it does not introduce a KnoVa-specific read API.
 
 ## Development
 

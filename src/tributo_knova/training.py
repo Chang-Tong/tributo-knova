@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import posixpath
+import re
 from collections.abc import Mapping
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
@@ -15,7 +16,6 @@ from tributo.algorithms import (
     ExecutionRequest,
     InputBinding,
     WorkerResources,
-    build_algorithm_dispatcher,
 )
 from tributo.algorithms.api import AlgorithmRunResult
 from tributo.algorithms.spi import InputExecutionContext, InputResolutionContext
@@ -26,13 +26,21 @@ from tributo.integrations.algorithm_inputs import (
     IngestionInputInvocation,
 )
 
+from tributo_knova._training_runtime import run_training
 from tributo_knova.protocol import TrainingExecutionRequest
 
 _CLICKHOUSE_BINDING_ID = "tributo.knova.ray.clickhouse"
 _INPUT_REFERENCE = "knova.training.input"
 _SHARED_STORAGE_TYPES = frozenset({"nfs", "nas", "shared_fs"})
 _CONTROL_HYPER_PARAMETERS = frozenset(
-    {"n_estimators", "num_rounds", "objective", "num_class"}
+    {
+        "early_stopping_rounds",
+        "eval_metric",
+        "n_estimators",
+        "num_rounds",
+        "objective",
+        "num_class",
+    }
 )
 _SENSITIVE_PROPERTY_TOKENS = frozenset(
     {"access", "credential", "key", "password", "secret", "token"}
@@ -77,6 +85,120 @@ def _positive_number(value: object, field: str) -> float:
     ):
         _invalid(f"{field} must be a positive number")
     return float(value)
+
+
+def _ratio(value: object, field: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or not 0 <= float(value) <= 1
+    ):
+        _invalid(f"{field} must be a finite number within [0, 1]")
+    return float(value)
+
+
+def _data_split_config(payload: Mapping[str, Any]) -> dict[str, Any]:
+    split = _mapping(payload.get("data_split", {}), "data_split")
+    train_ratio = _ratio(split.get("train_ratio", 0.7), "data_split.train_ratio")
+    validation_ratio = _ratio(
+        split.get("validation_ratio", 0.0),
+        "data_split.validation_ratio",
+    )
+    test_ratio = _ratio(split.get("test_ratio", 0.3), "data_split.test_ratio")
+    if not math.isclose(
+        train_ratio + validation_ratio + test_ratio,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        _invalid("data_split ratios must sum to 1")
+    if train_ratio <= 0:
+        _invalid("data_split.train_ratio must be positive")
+
+    strategy = _text(split.get("strategy", "RANDOM"), "data_split.strategy").upper()
+    if strategy not in {"RANDOM", "TIME_ORDERED"}:
+        _invalid("data_split.strategy must be RANDOM or TIME_ORDERED")
+    stratify = split.get("stratify", False)
+    if not isinstance(stratify, bool):
+        _invalid("data_split.stratify must be a boolean")
+    if strategy == "TIME_ORDERED" and stratify:
+        _invalid("data_split TIME_ORDERED and stratify=true are mutually exclusive")
+    if stratify:
+        _invalid("data_split.stratify=true is not supported by this runtime")
+
+    random_seed = split.get("random_seed", 42)
+    if random_seed is None:
+        random_seed = 42
+    if not isinstance(random_seed, int) or isinstance(random_seed, bool):
+        _invalid("data_split.random_seed must be an integer")
+    cross_validation = _mapping(
+        split.get("cross_validation", {"enabled": False}),
+        "data_split.cross_validation",
+    )
+    enabled = cross_validation.get("enabled", False)
+    if not isinstance(enabled, bool):
+        _invalid("data_split.cross_validation.enabled must be a boolean")
+    if enabled:
+        _invalid("data_split.cross_validation.enabled=true is not supported")
+    return {
+        "train_ratio": train_ratio,
+        "validation_ratio": validation_ratio,
+        "test_ratio": test_ratio,
+        "seed": random_seed % (2**32),
+        "split_strategy": strategy,
+        "stratify": stratify,
+    }
+
+
+def _evaluation_config(
+    payload: Mapping[str, Any], objective: str
+) -> tuple[list[str], dict[str, bool]]:
+    evaluation = _mapping(payload.get("evaluation", {}), "evaluation")
+    objective = objective.lower()
+    if objective.startswith("multi:"):
+        process_metrics = ["mlogloss"]
+        supported = {"auc": "auc", "accuracy": "merror", "loss": "mlogloss"}
+    elif objective.startswith("binary:"):
+        process_metrics = ["logloss"]
+        supported = {"auc": "auc", "accuracy": "error", "loss": "logloss"}
+    else:
+        process_metrics = ["rmse"]
+        supported = {
+            "rmse": "rmse",
+            "mae": "mae",
+            "mape": "mape",
+            "loss": "rmse",
+        }
+
+    requested: list[object] = [evaluation.get("primary_metric")]
+    for field in ("additional_metrics", "realtime_metrics"):
+        values = evaluation.get(field, [])
+        if not isinstance(values, list):
+            _invalid(f"evaluation.{field} must be an array")
+        requested.extend(values)
+    for raw_metric in requested:
+        if raw_metric is None:
+            continue
+        if not isinstance(raw_metric, str) or not raw_metric.strip():
+            _invalid("evaluation metric names must be non-empty strings")
+        metric = supported.get(raw_metric.strip().lower())
+        if metric is not None and metric not in process_metrics:
+            process_metrics.append(metric)
+
+    raw_artifacts = _mapping(evaluation.get("artifacts", {}), "evaluation.artifacts")
+    artifacts: dict[str, bool] = {}
+    for name, default in (
+        ("roc_curve", False),
+        ("threshold_analysis", False),
+        ("feature_importance", True),
+        ("correlation_matrix", False),
+    ):
+        value = raw_artifacts.get(name, default)
+        if not isinstance(value, bool):
+            _invalid(f"evaluation.artifacts.{name} must be a boolean")
+        artifacts[name] = value
+    return process_metrics, artifacts
 
 
 def _relative_prefix(value: object) -> str:
@@ -203,10 +325,15 @@ def _algorithm_config(
     )
     target = _mapping(payload.get("target"), "target")
     objective, num_class = _objective(target, hyper_parameters)
-    rounds = _positive_int(
+    requested_rounds = _positive_int(
         hyper_parameters.get("n_estimators", hyper_parameters.get("num_rounds", 100)),
         "algorithm.hyper_params.n_estimators",
     )
+    resource_limits = _mapping(payload.get("resource_limits", {}), "resource_limits")
+    max_epochs = _positive_int(
+        resource_limits.get("max_epochs", 1000), "resource_limits.max_epochs"
+    )
+    rounds = min(requested_rounds, max_epochs)
     model = {
         key: value
         for key, value in hyper_parameters.items()
@@ -215,12 +342,27 @@ def _algorithm_config(
     model["objective"] = objective
     if num_class is not None:
         model["num_class"] = num_class
+    process_metrics, _ = _evaluation_config(payload, objective)
+    model["eval_metric"] = process_metrics
+
+    training = {
+        "num_rounds": rounds,
+        **_data_split_config(payload),
+    }
+    early_stopping = hyper_parameters.get("early_stopping_rounds")
+    if early_stopping is not None:
+        training["early_stopping_rounds"] = _positive_int(
+            early_stopping,
+            "algorithm.hyper_params.early_stopping_rounds",
+        )
+        if training["validation_ratio"] <= 0:
+            _invalid("early stopping requires a non-empty validation split")
 
     return (
         {
             "data": {"label_col": label_name},
             "model": model,
-            "training": {"num_rounds": rounds},
+            "training": training,
             "ray": {"storage_path": ray_storage_path},
             "output": {"bundle_uri": bundle_uri},
         },
@@ -259,15 +401,17 @@ def _runtime_config(payload: Mapping[str, Any]) -> tuple[int, WorkerResources]:
 
 
 def _ingestion_invocation(
-    payload: Mapping[str, Any], feature_names: tuple[str, ...], label_name: str
+    payload: Mapping[str, Any],
+    feature_names: tuple[str, ...],
+    label_name: str,
 ) -> IngestionInputInvocation:
     datasource = _mapping(payload.get("datasource"), "datasource")
     datasource_type = _text(datasource.get("type"), "datasource.type").upper()
     if datasource_type != "CLICKHOUSE":
         _invalid("only datasource.type=CLICKHOUSE is supported")
     properties = _mapping(datasource.get("properties", {}), "datasource.properties")
-    native_table = _text(
-        properties.get("native_table"), "datasource.properties.native_table"
+    native_table = _native_clickhouse_table(
+        payload, properties, (*feature_names, label_name)
     )
     host = _text(datasource.get("host"), "datasource.host")
     database = _text(datasource.get("database_name"), "datasource.database_name")
@@ -306,6 +450,78 @@ def _ingestion_invocation(
             binding_id=_CLICKHOUSE_BINDING_ID,
         )
     )
+
+
+def _native_clickhouse_table(
+    payload: Mapping[str, Any],
+    properties: Mapping[str, Any],
+    required_columns: tuple[str, ...],
+) -> str:
+    """Resolve KnoVa's simple DIRECT_QUERY shape to a native Ray table read."""
+    configured = properties.get("native_table")
+    if configured is not None:
+        return _text(configured, "datasource.properties.native_table")
+
+    tables = payload.get("tables")
+    data_query = payload.get("data_query")
+    if (
+        not isinstance(tables, list)
+        or len(tables) != 1
+        or not isinstance(data_query, Mapping)
+    ):
+        _invalid(
+            "datasource.properties.native_table is required unless data_query "
+            "is a simple single-table projection"
+        )
+
+    table = _mapping(tables[0], "tables[0]")
+    database = _text(table.get("database_name"), "tables[0].database_name")
+    table_name = _text(table.get("table_name"), "tables[0].table_name")
+    query = _mapping(data_query.get("query"), "data_query.query")
+    sql = _text(query.get("sql"), "data_query.query.sql")
+    params = _mapping(query.get("params", {}), "data_query.query.params")
+    if params:
+        _invalid(
+            "datasource.properties.native_table is required for parameterized queries"
+        )
+
+    identifier = r"`?[A-Za-z_][A-Za-z0-9_]*`?"
+    match = re.fullmatch(
+        rf"(?is)\s*select\s+(.+?)\s+from\s+"
+        rf"({identifier}(?:\.{identifier})?)"
+        rf"(?:\s+(?:as\s+)?({identifier}))?\s*;?\s*",
+        sql,
+    )
+    source_name = match.group(2).replace("`", "") if match else None
+    qualified = f"{database}.{table_name}"
+    if source_name not in {table_name, qualified}:
+        _invalid(
+            "datasource.properties.native_table is required unless data_query "
+            "is a simple single-table projection"
+        )
+
+    assert match is not None
+    table_alias = match.group(3)
+    if table_alias is not None:
+        table_alias = table_alias.replace("`", "")
+    projected_columns: list[str] = []
+    for item in match.group(1).split(","):
+        projection = re.fullmatch(
+            rf"(?is)\s*(?:({identifier})\.)?({identifier})\s+as\s+"
+            rf"{identifier}\s*",
+            item,
+        )
+        if projection is None:
+            _invalid("data_query must contain plain column projections only")
+        projection_alias = projection.group(1)
+        if projection_alias is not None:
+            projection_alias = projection_alias.replace("`", "")
+        if table_alias is not None and projection_alias not in {None, table_alias}:
+            _invalid("data_query projection alias does not match its source table")
+        projected_columns.append(projection.group(2).replace("`", ""))
+    if tuple(projected_columns) != required_columns:
+        _invalid("data_query columns do not match the requested features and target")
+    return qualified
 
 
 def _build_execution(
@@ -514,9 +730,7 @@ def _artifact_manifest(
                 metadata = {"supports_tree_shap": True}
             files.append(
                 {
-                    "path": posixpath.join(
-                        "artifacts", artifact_name, relative_path
-                    ),
+                    "path": posixpath.join("artifacts", artifact_name, relative_path),
                     "size": size,
                     "hash": f"sha256:{sha256}",
                     "metadata": metadata,
@@ -552,16 +766,31 @@ def _artifact_manifest(
     }
 
 
-def _training_rows(result: AlgorithmRunResult) -> int:
-    receipt = getattr(result, "execution_receipt", None)
-    if receipt is None:
-        return 0
-    return sum(worker.rows_processed or 0 for worker in receipt.workers)
+def _internal_metrics(result: AlgorithmRunResult) -> Mapping[str, Any]:
+    metrics = getattr(result.execution, "metrics", {})
+    if not isinstance(metrics, Mapping):
+        raise _TrainingExecutionError("training metrics are invalid")
+    return metrics
+
+
+def _sample_rows(result: AlgorithmRunResult) -> dict[str, int]:
+    raw_rows = _internal_metrics(result).get("sample_rows")
+    if not isinstance(raw_rows, Mapping):
+        raise _TrainingExecutionError("training split row counts are missing")
+    rows: dict[str, int] = {}
+    for name in ("total", "train", "validation", "test"):
+        value = raw_rows.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise _TrainingExecutionError("training split row counts are invalid")
+        rows[name] = value
+    if rows["train"] + rows["validation"] + rows["test"] != rows["total"]:
+        raise _TrainingExecutionError("training split row counts are inconsistent")
+    return rows
 
 
 def _evaluation_metrics(result: AlgorithmRunResult) -> list[dict[str, Any]]:
     metrics: list[dict[str, Any]] = []
-    raw_metrics = getattr(result.execution, "metrics", {})
+    raw_metrics = _internal_metrics(result).get("evaluation", {})
     if not isinstance(raw_metrics, Mapping):
         return metrics
     for name, value in raw_metrics.items():
@@ -575,6 +804,72 @@ def _evaluation_metrics(result: AlgorithmRunResult) -> list[dict[str, Any]]:
     return sorted(metrics, key=lambda item: item["metric_name"])
 
 
+def _evaluation_details(
+    result: AlgorithmRunResult,
+    task_type: str,
+) -> dict[str, Any]:
+    raw_details = _internal_metrics(result).get("evaluation_details", {})
+    if not isinstance(raw_details, Mapping):
+        raw_details = {}
+    details = dict(raw_details)
+    if task_type in {"BINARY_CLASSIFICATION", "MULTICLASS_CLASSIFICATION"}:
+        details.setdefault("confusion_matrix", None)
+        details.setdefault("roc_curve", None)
+        details.setdefault("threshold_analysis", None)
+    return details
+
+
+def _feature_analysis(
+    payload: Mapping[str, Any],
+    result: AlgorithmRunResult,
+    feature_ids: Mapping[str, str],
+) -> dict[str, Any] | None:
+    evaluation = _mapping(payload.get("evaluation", {}), "evaluation")
+    artifacts = _mapping(evaluation.get("artifacts", {}), "evaluation.artifacts")
+    include_importance = artifacts.get("feature_importance", True) is True
+    include_correlation = artifacts.get("correlation_matrix", False) is True
+    if not include_importance and not include_correlation:
+        return None
+
+    importance: list[dict[str, Any]] = []
+    raw_importance = _internal_metrics(result).get("feature_importance", [])
+    # Tributo freezes portable result lists to tuples at its public result
+    # boundary.  Accept both shapes so feature importance survives that
+    # boundary and reaches KnoVa's terminal event.
+    if include_importance and isinstance(raw_importance, (list, tuple)):
+        for item in raw_importance:
+            if not isinstance(item, Mapping):
+                continue
+            name = item.get("model_feature_name")
+            rank = item.get("rank")
+            score = item.get("importance_score")
+            if (
+                isinstance(name, str)
+                and name in feature_ids
+                and isinstance(rank, int)
+                and not isinstance(rank, bool)
+                and isinstance(score, (int, float))
+                and not isinstance(score, bool)
+                and math.isfinite(float(score))
+            ):
+                importance.append(
+                    {
+                        "rank": rank,
+                        "feature_id": feature_ids[name],
+                        "model_feature_name": name,
+                        "importance_score": float(score),
+                    }
+                )
+    return {
+        "importance_ranking": importance,
+        "correlation_matrix": (
+            _internal_metrics(result).get("correlation_matrix")
+            if include_correlation
+            else None
+        ),
+    }
+
+
 def _completed_payload(
     request: TrainingExecutionRequest,
     result: AlgorithmRunResult,
@@ -585,7 +880,7 @@ def _completed_payload(
         raise _TrainingExecutionError("training features are required")
     target = _mapping(payload.get("target"), "target")
     task_type = _text(target.get("task_type"), "target.task_type").upper()
-    rows = _training_rows(result)
+    rows = _sample_rows(result)
     metrics = _evaluation_metrics(result)
     requested_evaluation = payload.get("evaluation")
     primary_name = None
@@ -607,17 +902,21 @@ def _completed_payload(
     )
 
     model_features: list[dict[str, Any]] = []
+    feature_ids: dict[str, str] = {}
     for index, raw_feature in enumerate(features):
         feature = _mapping(raw_feature, f"features[{index}]")
         origin = _mapping(feature.get("origin"), f"features[{index}].origin")
+        model_feature_name = _text(
+            origin.get("column_name"),
+            f"features[{index}].origin.column_name",
+        )
+        feature_id = str(feature.get("feature_id") or f"f{index + 1:03d}")
+        feature_ids[model_feature_name] = feature_id
         model_features.append(
             {
                 "model_feature_index": index,
-                "model_feature_name": _text(
-                    origin.get("column_name"),
-                    f"features[{index}].origin.column_name",
-                ),
-                "feature_id": str(feature.get("feature_id") or f"f{index + 1:03d}"),
+                "model_feature_name": model_feature_name,
+                "feature_id": feature_id,
                 "transformation": "PASSTHROUGH",
             }
         )
@@ -626,12 +925,7 @@ def _completed_payload(
     return {
         "result_summary": {
             "primary_metric": primary,
-            "sample_rows": {
-                "total": rows,
-                "train": rows,
-                "validation": 0,
-                "test": 0,
-            },
+            "sample_rows": rows,
         },
         "training_result": {
             "algorithm_key": _text(
@@ -641,11 +935,15 @@ def _completed_payload(
             "model_features": model_features,
             "evaluation": {
                 "eval_type": task_type,
-                "sample_rows": 0,
+                "sample_rows": rows["test"],
                 "metrics": metrics,
-                "details": {},
+                "details": _evaluation_details(result, task_type),
             },
-            "feature_analysis": None,
+            "feature_analysis": _feature_analysis(
+                payload,
+                result,
+                feature_ids,
+            ),
             "tuning_result": None,
         },
         "artifact_manifest": _artifact_manifest(
@@ -660,7 +958,9 @@ def execute_training(
 ) -> AlgorithmRunResult:
     """Execute one KnoVa request through public Tributo algorithm contracts."""
     try:
-        execution, input_context, resolution_context, rounds = _build_execution(request)
+        execution, input_context, _resolution_context, _rounds = _build_execution(
+            request
+        )
     except _TrainingConfigurationError:
         raise
     except Exception:
@@ -668,20 +968,33 @@ def execute_training(
 
     try:
         reporter.phase("PREPARING")
-        reporter.publish(
-            "METRICS",
-            {
-                "current_round": 0,
-                "total_rounds": rounds,
-                "progress_percent": 0.0,
-                "metrics": [],
-            },
-            phase="EXECUTING",
+        binding = execution.algorithm_request.input_binding
+        invocation = input_context.values.get(_INPUT_REFERENCE)
+        if not isinstance(invocation, IngestionInputInvocation):
+            raise _TrainingExecutionError("training input invocation is invalid")
+        payload = request.model_dump(mode="python")
+        target = _mapping(payload.get("target"), "target")
+        task_type = _text(target.get("task_type"), "target.task_type").upper()
+        model_config = execution.algorithm_request.algorithm_config.get("model", {})
+        if not isinstance(model_config, Mapping):
+            raise _TrainingExecutionError("training model configuration is invalid")
+        raw_num_class = model_config.get("num_class")
+        _, evaluation_artifacts = _evaluation_config(
+            payload,
+            _text(model_config.get("objective"), "algorithm objective"),
         )
-        result = build_algorithm_dispatcher().execute(
-            execution,
-            input_context,
-            resolution_context=resolution_context,
+        result = run_training(
+            ingestion_request=invocation.request,
+            feature_names=binding.feature_names,
+            label_name=_text(binding.label_name, "training label name"),
+            algorithm_config=execution.algorithm_request.algorithm_config,
+            worker_count=execution.worker_count,
+            resources=execution.resources_per_worker or WorkerResources(),
+            run_id=request.job_id,
+            reporter=reporter,
+            task_type=task_type,
+            num_class=(int(raw_num_class) if raw_num_class is not None else None),
+            evaluation_artifacts=evaluation_artifacts,
         )
         if result.execution.status != "succeeded":
             raise _TrainingExecutionError("XGBoost training did not succeed")

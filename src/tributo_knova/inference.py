@@ -246,9 +246,7 @@ def _model_reference(
         )
 
     alternative, file = _artifact_alternative(model, prefer_ubj=prefer_native)
-    protocol_format = _text(
-        alternative.get("format"), "model artifact format"
-    ).lower()
+    protocol_format = _text(alternative.get("format"), "model artifact format").lower()
     format_id = "ubj" if protocol_format == "xgboost" else protocol_format
     metadata = _mapping(file.get("metadata", {}), "model artifact metadata")
     input_fields, output_fields = _signature_fields(
@@ -505,8 +503,7 @@ def _build_request(
             "database": database,
             "columns": columns,
             "partitioning": {
-                "mode": "parallel",
-                "column": entity_column,
+                "mode": "auto",
                 "num_partitions": concurrency,
             },
         },
@@ -674,7 +671,7 @@ def _execution_policy(
     concurrency = _positive_int(
         execution.get("concurrency", options.get("max_predictor_actors")),
         "execution.concurrency",
-        4,
+        2,
     )
     return predictor_batch, sink_batch, concurrency
 
@@ -1127,7 +1124,16 @@ def execute_inference(
         raise _InferenceConfigurationError("inference request mapping failed") from None
 
     try:
-        reporter.phase("EXECUTING")
+        reporter.publish(
+            "PROGRESS",
+            {
+                "processed_rows": 0,
+                "result_rows": 0,
+                "total_rows": measured_rows,
+                "percent": 0.0,
+            },
+            phase="EXECUTING",
+        )
         retries = 0
         while True:
             with _input_environment(*input_credentials):
