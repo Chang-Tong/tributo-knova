@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import logging
 import re
 from contextlib import suppress
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ _BINDING_ID = "tributo.knova.ray.clickhouse"
 _TABLE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 _COLUMN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _QUOTED_COLUMN_IDENTIFIER = re.compile(r"^`[A-Za-z_][A-Za-z0-9_]*`$")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _qualified_table(database: str, table: str) -> str:
@@ -176,6 +178,15 @@ class RayClickHouseBinding:
             order_by = _discover_sorting_key(
                 dsn=dsn,
                 qualified_table=qualified_table,
+            )
+        if order_by is None:
+            _LOGGER.warning(
+                "ClickHouse table %s has no usable simple sorting key for Ray "
+                "read_clickhouse(order_by=...); Ray will fall back to one read "
+                "task, so a large result can exhaust memory on a single Ray "
+                "worker node. Define a simple ClickHouse ORDER BY key or configure "
+                "explicit sharding columns.",
+                qualified_table,
             )
 
         dataset = ray.data.read_clickhouse(

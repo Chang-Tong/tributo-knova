@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pyarrow as pa
@@ -150,6 +151,31 @@ def test_auto_sharding_discovers_clickhouse_sorting_key(
 
     assert calls[0]["order_by"] == (["user_id"], False)
     assert "order key enables Ray parallel read tasks" in result.diagnostics[0]
+
+
+def test_missing_sorting_key_warns_about_single_node_memory_risk(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    dataset = _Dataset()
+
+    monkeypatch.setattr(
+        "tributo_knova.clickhouse._discover_sorting_key",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ray.data.read_clickhouse",
+        lambda **kwargs: calls.append(kwargs) or dataset,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="tributo_knova.clickhouse"):
+        result = RayClickHouseBinding().compile(_request())
+
+    assert calls[0]["order_by"] is None
+    assert "single Ray worker node" in caplog.text
+    assert "exhaust memory" in caplog.text
+    assert "single-task fallback" in result.physical_splits.detail
 
 
 def test_sorting_key_metadata_uses_bound_parameters(
