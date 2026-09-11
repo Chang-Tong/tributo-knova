@@ -26,24 +26,32 @@ UBJ-only prediction, and compatible upstream release tags remain open.
 
 ## ClickHouse parallel reads
 
-Training and inference share one Tributo ingestion Binding backed by
-`ray.data.read_clickhouse`. Ray reads row-count, byte-size, sample-schema, and
-sample-block metadata, but it does not discover a deterministic ordering key.
-For Tributo `auto` partitioning, this package reads
-`system.tables.sorting_key` and passes every simple sorting-key column to Ray in
-its original order. A composite key such as `tenant_id, event_time, user_id`
-therefore becomes `order_by=(["tenant_id", "event_time", "user_id"], False)`.
-Ray then owns block sizing, read-task scheduling, and execution. For inference,
-KnoVa asks Ray for enough ordered read tasks to keep each task at or below
-200,000 rows. Completed tasks flow through Ray's native backpressure into the
-inference actor pool, whose default adaptive batch size is also capped at
-200,000 rows.
+Training and inference share one Tributo ingestion Binding. It imports
+`ray-clickhouse` for bounded Arrow streaming and disjoint physical-partition or
+integer-range reads, while all execution still uses Ray's public Datasource API.
+For inference, each emitted source block is capped at 200,000 rows and 64 MiB;
+the measured input row count determines the requested number of range tasks.
+Leading equality predicates are sent to ClickHouse as bound parameters and are
+recorded as exact Tributo pushdowns.
 
-Sorting-key SQL expressions are not passed through as arbitrary SQL. If the key
-contains an expression such as `toDate(event_time)`, or metadata access is not
-available, the Binding retains Ray's safe single-task fallback and emits a
-single-worker memory-risk warning. KnoVa does not introduce a parallel reader
-without a deterministic key because that could duplicate or omit rows.
+For Tributo `auto` partitioning, KnoVa reads the table engine, active physical
+partitions, sorting key, and first key type. Multiple physical partitions are
+balanced by on-disk bytes. Otherwise an integer first sorting column creates
+disjoint range tasks. With a composite key, only its first integer column is
+needed for row coverage; the remaining columns do not need to be discarded or
+invented as independent split keys.
+
+When a simple sorting key exists but its first column is not an integer, KnoVa
+retains `ray.data.read_clickhouse(order_by=...)` so existing parallel ordered
+reads keep working. A key such as `tenant_id, event_time, user_id` is passed in
+its original order. This fallback uses Ray's native global ORDER BY/OFFSET
+implementation.
+
+Sorting-key SQL expressions are not passed through as arbitrary SQL. If neither
+physical partitions nor an integer range key is available, the Binding uses one
+bounded streaming task and emits a single-worker pressure warning. If metadata
+itself is unavailable, it falls back to Ray's native single-task reader. KnoVa
+does not invent unsafe split predicates that could duplicate or omit rows.
 
 ## Development
 
@@ -72,7 +80,8 @@ uv run python scripts/local_smoke.py --shap-mode exact --exercise-recovery
 
 The script creates isolated ClickHouse tables, submits a real training task and
 a real inference task through Redis, verifies one terminal event per task and
-the exact output row count, then removes its temporary tables and model Bundle.
+the exact output row count, then removes its temporary tables, Redis messages,
+events, and model Bundle.
 The SHAP modes additionally verify the explanation exactness and feature width
 inside a real ClickHouse `pred_extra` result.
 The recovery mode also stages a pending Redis delivery and an admitted Ray Job,

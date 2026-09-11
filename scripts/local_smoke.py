@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -171,6 +172,58 @@ def _events(
     return [
         json.loads(fields["payload"]) for _event_id, fields in client.xrange(stream)
     ]
+
+
+def _cleanup_redis_test_data(
+    client: redis.Redis,
+    *,
+    suffix: str,
+    job_id: str,
+    execution_id: str,
+) -> None:
+    operations = (
+        (
+            "knova:aimodel:training:distributed:tasks",
+            "knova-trainers",
+            "job_id",
+            (
+                job_id,
+                f"knova-pending-recovery-{suffix}",
+                f"knova-active-recovery-{suffix}",
+            ),
+        ),
+        (
+            "knova:aimodel:inference:distributed:tasks",
+            "knova-backend-inference",
+            "execution_id",
+            (execution_id,),
+        ),
+    )
+    operation_ids: list[str] = []
+    for stream, group, identity_field, identities in operations:
+        operation_ids.extend(identities)
+        message_ids = [
+            message_id
+            for message_id, fields in client.xrange(stream)
+            if fields.get(identity_field) in identities
+        ]
+        if not message_ids:
+            continue
+        with suppress(redis.ResponseError):
+            client.xack(stream, group, *message_ids)
+        client.xdel(stream, *message_ids)
+    client.delete(
+        *(
+            key
+            for operation_id in operation_ids
+            for key in (
+                f"knova:aimodel:training:distributed:events:{operation_id}",
+                f"knova:aimodel:training:distributed:cancel:{operation_id}",
+                f"knova:aimodel:inference:distributed:events:{operation_id}",
+                f"knova:aimodel:inference:distributed:cancel:{operation_id}",
+            )
+        )
+    )
 
 
 def _wait_terminal(
@@ -611,7 +664,16 @@ def main() -> int:
         _require_success(training_terminal, job_id)
         artifact_manifest = training_terminal["artifact_manifest"]
         bundle_uri = _bundle_uri(artifact_manifest)
-        if training_terminal["result_summary"]["sample_rows"]["train"] != 300:
+        sample_rows = training_terminal["result_summary"]["sample_rows"]
+        if (
+            sample_rows["total"] != 300
+            or sample_rows["train"]
+            + sample_rows["validation"]
+            + sample_rows["test"]
+            != sample_rows["total"]
+            or sample_rows["validation"] <= 0
+            or sample_rows["test"] <= 0
+        ):
             raise RuntimeError("training terminal event has an invalid row count")
         formats = {
             alternative["format"]
@@ -730,6 +792,13 @@ def main() -> int:
             clickhouse.command(f"DROP TABLE IF EXISTS knova.{output_table}")
             clickhouse.command(f"DROP TABLE IF EXISTS knova.{input_table}")
         clickhouse.close()
+        with suppress(Exception):
+            _cleanup_redis_test_data(
+                redis_client,
+                suffix=suffix,
+                job_id=job_id,
+                execution_id=execution_id,
+            )
         redis_client.close()
         if s3 is not None:
             _delete_s3_prefix(s3, args.s3_bucket, storage_prefix)

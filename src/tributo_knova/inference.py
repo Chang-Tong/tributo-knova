@@ -65,6 +65,7 @@ _MEMORY_PRESSURE_ERRORS = frozenset(
 )
 _MAX_ADAPTIVE_RETRIES = 3
 _CLICKHOUSE_READ_TASK_ROWS = 200_000
+_CLICKHOUSE_READ_TASK_BYTES = 64 * 1024 * 1024
 
 
 class _InferenceConfigurationError(ValueError):
@@ -588,6 +589,7 @@ def _build_request(
             transforms=transforms,
             read_options=ReadOptions(
                 batch_size=_CLICKHOUSE_READ_TASK_ROWS,
+                target_split_size_bytes=_CLICKHOUSE_READ_TASK_BYTES,
                 concurrency=concurrency,
             ),
         ),

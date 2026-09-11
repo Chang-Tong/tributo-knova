@@ -9,7 +9,7 @@ are supplied only through the process environment.
 | Protocol | Training `job_id`; inference `execution_id`; required tenant/model/version/task identities; v2 lifecycle events | Unit suite |
 | Broker | Redis Streams admission, ACK, retry, idempotency, queued cancellation, watchdog and one terminal event | Unit suite |
 | Restart recovery | `XAUTOCLAIM` pending delivery recovery and active Ray Job cancellation state reconstruction | Unit suite and `--exercise-recovery` smoke |
-| ClickHouse input | Ray-native ordered reads; AUTO discovery preserves simple composite sorting keys; Ray owns count/size/schema estimates and block scheduling | Unit suite and KnoVa devbox integration |
+| ClickHouse input | Public Ray Datasource reads; byte-balanced physical partitions or integer ranges; parameterized filter pushdown; 200k-row/64 MiB inference blocks; native ordered fallback preserves composite keys | Unit suite and KnoVa devbox integration |
 | Training | Ray-native ClickHouse input, lossless train/validation/test split, two-worker distributed XGBoost and live per-round metrics | Unit suite and KnoVa devbox integration |
 | Evaluation | Full test-set metrics, confusion matrix, ROC, threshold analysis, gain importance and distributed Pearson feature correlation | Unit suite and KnoVa devbox integration |
 | Checkpoint | Official `model.ubj` and `feature_names.json` checkpoint on shared NAS/NFS path | Local integration smoke |

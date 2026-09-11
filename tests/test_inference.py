@@ -128,6 +128,7 @@ def test_build_request_uses_public_inference_contract_without_credentials() -> N
         "num_partitions": 3,
     }
     assert core.input.read_options.batch_size == 200_000
+    assert core.input.read_options.target_split_size_bytes == 64 * 1024 * 1024
     assert core.input.read_options.concurrency == 3
     assert core.input.transforms.steps[0].column == "stat_month"
     assert core.input.transforms.steps[0].value == "202601"
@@ -384,6 +385,7 @@ def test_default_adaptive_batch_and_read_tasks_are_capped_at_200k_rows() -> None
     assert core.execution.batch_size == 200_000
     assert core.input.source.options["partitioning"]["num_partitions"] == 50
     assert core.input.read_options.batch_size == 200_000
+    assert core.input.read_options.target_split_size_bytes == 64 * 1024 * 1024
 
 
 def test_memory_pressure_retries_with_smaller_batch(

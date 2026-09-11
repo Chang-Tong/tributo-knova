@@ -102,10 +102,10 @@ def _data_split_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     split = _mapping(payload.get("data_split", {}), "data_split")
     train_ratio = _ratio(split.get("train_ratio", 0.7), "data_split.train_ratio")
     validation_ratio = _ratio(
-        split.get("validation_ratio", 0.0),
+        split.get("validation_ratio", 0.15),
         "data_split.validation_ratio",
     )
-    test_ratio = _ratio(split.get("test_ratio", 0.3), "data_split.test_ratio")
+    test_ratio = _ratio(split.get("test_ratio", 0.15), "data_split.test_ratio")
     if not math.isclose(
         train_ratio + validation_ratio + test_ratio,
         1.0,

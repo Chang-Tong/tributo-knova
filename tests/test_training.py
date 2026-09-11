@@ -388,6 +388,17 @@ def test_execute_training_maps_knova_to_public_tributo_contracts(
     assert artifact_manifest["total_size_bytes"] == 220
 
 
+def test_default_data_split_keeps_validation_and_test_sets() -> None:
+    assert training._data_split_config({}) == {
+        "train_ratio": 0.7,
+        "validation_ratio": 0.15,
+        "test_ratio": 0.15,
+        "seed": 42,
+        "split_strategy": "RANDOM",
+        "stratify": False,
+    }
+
+
 def test_s3_requires_explicit_ray_storage_and_maps_bundle_uri(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
