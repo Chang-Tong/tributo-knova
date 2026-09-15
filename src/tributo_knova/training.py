@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+import os
 import posixpath
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
@@ -25,12 +27,13 @@ from tributo.integrations.algorithm_inputs import (
     INGESTION_RESOLVER_ID,
     IngestionInputInvocation,
 )
+from tributo_algorithms_boosting import run_xgboost_training
 
-from tributo_knova._training_runtime import run_training
 from tributo_knova.protocol import TrainingExecutionRequest
 
-_CLICKHOUSE_BINDING_ID = "tributo.knova.ray.clickhouse"
+_CLICKHOUSE_BINDING_ID = "ray_clickhouse.ray.clickhouse"
 _INPUT_REFERENCE = "knova.training.input"
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHARED_STORAGE_TYPES = frozenset({"nfs", "nas", "shared_fs"})
 _CONTROL_HYPER_PARAMETERS = frozenset(
     {
@@ -404,7 +407,7 @@ def _ingestion_invocation(
     payload: Mapping[str, Any],
     feature_names: tuple[str, ...],
     label_name: str,
-) -> IngestionInputInvocation:
+) -> tuple[IngestionInputInvocation, tuple[str, str]]:
     datasource = _mapping(payload.get("datasource"), "datasource")
     datasource_type = _text(datasource.get("type"), "datasource.type").upper()
     if datasource_type != "CLICKHOUSE":
@@ -433,23 +436,53 @@ def _ingestion_invocation(
     password = datasource.get("password")
     if username is not None:
         options["user"] = _text(username, "datasource.username")
-    if password is not None:
-        if not isinstance(password, str):
-            _invalid("datasource.password must be a string")
-        options["password"] = password
+    if password is None:
+        reference = datasource.get("credential_ref")
+        if isinstance(reference, str) and reference.startswith("env://"):
+            password_env = reference.removeprefix("env://")
+            if _ENV_NAME.fullmatch(password_env) is None:
+                _invalid("datasource.credential_ref must name an environment variable")
+            password = os.environ.get(password_env, "")
+        elif reference is not None:
+            _invalid("datasource.credential_ref must use env://VARIABLE")
+        else:
+            password = os.environ.get("TRIBUTO_CLICKHOUSE_PASSWORD", "")
+    if not isinstance(password, str):
+        _invalid("datasource.password must be a string or env credential reference")
 
     source = ProviderSourceConfig(
         provider="tributo.clickhouse",
         uri=f"clickhouse://{uri_host}:{port}/{database}",
         options=options,
     )
-    return IngestionInputInvocation(
-        request=IngestionRequest(
-            source=source,
-            engine="ray",
-            binding_id=_CLICKHOUSE_BINDING_ID,
-        )
+    return (
+        IngestionInputInvocation(
+            request=IngestionRequest(
+                source=source,
+                engine="ray",
+                binding_id=_CLICKHOUSE_BINDING_ID,
+            )
+        ),
+        (str(username or ""), password),
     )
+
+
+@contextmanager
+def _clickhouse_environment(credentials: tuple[str, str]) -> Iterator[None]:
+    names = {
+        "TRIBUTO_CLICKHOUSE_USER": credentials[0],
+        "TRIBUTO_CLICKHOUSE_PASSWORD": credentials[1],
+    }
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ.update(names)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _native_clickhouse_table(
@@ -531,6 +564,7 @@ def _build_execution(
     InputExecutionContext,
     InputResolutionContext,
     int,
+    tuple[str, str],
 ]:
     payload = request.model_dump(mode="python")
     feature_names, label_name = _columns(payload)
@@ -539,7 +573,7 @@ def _build_execution(
         payload, label_name, ray_storage_path, bundle_uri
     )
     worker_count, resources = _runtime_config(payload)
-    invocation = _ingestion_invocation(payload, feature_names, label_name)
+    invocation, credentials = _ingestion_invocation(payload, feature_names, label_name)
     values = {_INPUT_REFERENCE: invocation}
     execution = ExecutionRequest(
         algorithm_request=AlgorithmRequest(
@@ -563,6 +597,7 @@ def _build_execution(
         InputExecutionContext(values=values),
         InputResolutionContext(values=values),
         rounds,
+        credentials,
     )
 
 
@@ -958,9 +993,13 @@ def execute_training(
 ) -> AlgorithmRunResult:
     """Execute one KnoVa request through public Tributo algorithm contracts."""
     try:
-        execution, input_context, _resolution_context, _rounds = _build_execution(
-            request
-        )
+        (
+            execution,
+            input_context,
+            _resolution_context,
+            _rounds,
+            clickhouse_credentials,
+        ) = _build_execution(request)
     except _TrainingConfigurationError:
         raise
     except Exception:
@@ -983,19 +1022,20 @@ def execute_training(
             payload,
             _text(model_config.get("objective"), "algorithm objective"),
         )
-        result = run_training(
-            ingestion_request=invocation.request,
-            feature_names=binding.feature_names,
-            label_name=_text(binding.label_name, "training label name"),
-            algorithm_config=execution.algorithm_request.algorithm_config,
-            worker_count=execution.worker_count,
-            resources=execution.resources_per_worker or WorkerResources(),
-            run_id=request.job_id,
-            reporter=reporter,
-            task_type=task_type,
-            num_class=(int(raw_num_class) if raw_num_class is not None else None),
-            evaluation_artifacts=evaluation_artifacts,
-        )
+        with _clickhouse_environment(clickhouse_credentials):
+            result = run_xgboost_training(
+                ingestion_request=invocation.request,
+                feature_names=binding.feature_names,
+                label_name=_text(binding.label_name, "training label name"),
+                algorithm_config=execution.algorithm_request.algorithm_config,
+                worker_count=execution.worker_count,
+                resources=execution.resources_per_worker or WorkerResources(),
+                run_id=request.job_id,
+                reporter=reporter,
+                task_type=task_type,
+                num_class=(int(raw_num_class) if raw_num_class is not None else None),
+                evaluation_artifacts=evaluation_artifacts,
+            )
         if result.execution.status != "succeeded":
             raise _TrainingExecutionError("XGBoost training did not succeed")
         reporter.publish(

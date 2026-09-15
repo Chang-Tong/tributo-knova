@@ -115,7 +115,7 @@ def test_build_request_uses_public_inference_contract_without_credentials() -> N
     assert core.run_id == "inference-1"
     assert core.model.kind == "bundle"
     assert core.input.engine == "tributo.ray_data"
-    assert core.input.binding_id == "tributo.knova.ray.clickhouse"
+    assert core.input.binding_id == "ray_clickhouse.ray.clickhouse"
     assert core.input.source.options["table"] == "analytics.features"
     assert core.input.source.options["columns"] == [
         "user_id",
@@ -137,10 +137,24 @@ def test_build_request_uses_public_inference_contract_without_credentials() -> N
     assert core.execution.batch_size == 500
     assert core.execution.concurrency == 3
     assert core.result_sink.sink_id == "data-write-v1"
+    assert core.result_sink.target == (
+        "clickhouse://clickhouse:8123/analytics/ml_inference_result"
+    )
+    assert core.result_sink.binding_id == "tributo.ray.clickhouse"
+    assert core.result_sink.options == {"batch_rows": 500, "concurrency": 3}
+    assert core.result_sink.runtime_options == {
+        "user": "writer",
+        "credential_ref": "env://KNOVA_OUTPUT_CLICKHOUSE_PASSWORD",
+    }
     assert sink.sink_id == "data-write-v1"
-    assert credentials == ("reader", _SECRET)
+    assert credentials == {
+        "TRIBUTO_CLICKHOUSE_USER": "reader",
+        "TRIBUTO_CLICKHOUSE_PASSWORD": _SECRET,
+        "KNOVA_OUTPUT_CLICKHOUSE_PASSWORD": _SECRET,
+    }
     assert _SECRET not in core.model_dump_json()
     assert _SECRET not in repr(core)
+    assert _SECRET not in repr(sink)
 
 
 def test_standalone_onnx_maps_to_public_artifact_importer() -> None:
@@ -259,9 +273,7 @@ def test_protocol_xgboost_artifact_maps_to_public_ubj_importer() -> None:
 
     assert core.model.format_id == "onnx"
     assert sink._model_reference["format_id"] == "ubj"
-    assert sink._model_reference["uri"].endswith(
-        "/artifacts/native-model/model.ubj"
-    )
+    assert sink._model_reference["uri"].endswith("/artifacts/native-model/model.ubj")
 
 
 def test_complex_query_is_rejected_without_executing_raw_sql() -> None:
@@ -281,7 +293,7 @@ def test_execute_inference_scopes_credentials_and_reports_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reporter = _Reporter()
-    captured: list[tuple[Any, Any, str | None]] = []
+    captured: list[tuple[Any, Any, str | None, str | None]] = []
     monkeypatch.setenv("TRIBUTO_CLICKHOUSE_PASSWORD", "previous")
 
     class Result:
@@ -296,7 +308,12 @@ def test_execute_inference_scopes_credentials_and_reports_completion(
 
     def run(core: Any, *, bound_sink: Any) -> Result:
         captured.append(
-            (core, bound_sink, os.environ.get("TRIBUTO_CLICKHOUSE_PASSWORD"))
+            (
+                core,
+                bound_sink,
+                os.environ.get("TRIBUTO_CLICKHOUSE_PASSWORD"),
+                os.environ.get("KNOVA_OUTPUT_CLICKHOUSE_PASSWORD"),
+            )
         )
         return Result()
 
@@ -307,7 +324,9 @@ def test_execute_inference_scopes_credentials_and_reports_completion(
 
     assert result.status == "succeeded"
     assert captured[0][2] == _SECRET
+    assert captured[0][3] == _SECRET
     assert os.environ["TRIBUTO_CLICKHOUSE_PASSWORD"] == "previous"
+    assert "KNOVA_OUTPUT_CLICKHOUSE_PASSWORD" not in os.environ
     assert [event[0] for event in reporter.events] == [
         "PHASE",
         "PROGRESS",
@@ -547,11 +566,12 @@ def test_tree_shap_batch_loads_ubj_and_preserves_rows(
     assert result["__knova_shap_group"].tolist() == [0, 0, 0]
 
 
-def test_bound_sink_delegates_to_ray_native_clickhouse(
+def test_bound_sink_delegates_to_tributo_write_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _core, sink, _credentials = inference._build_request(_request())
     calls: list[tuple[str, dict[str, Any]]] = []
+    writes: list[tuple[Any, Any]] = []
 
     class Dataset:
         def map_batches(self, _fn: Any, **kwargs: Any) -> Dataset:
@@ -562,29 +582,30 @@ def test_bound_sink_delegates_to_ray_native_clickhouse(
             calls.append(("materialize", {}))
             return self
 
-        def count(self) -> int:
-            calls.append(("count", {}))
-            return 7
+    class Gateway:
+        def execute(self, request: Any, handle: Any) -> Any:
+            writes.append((request, handle))
+            return SimpleNamespace(
+                rows_written=7,
+                binding_id="tributo.ray.clickhouse",
+                committed=True,
+            )
 
-        def write_clickhouse(self, **kwargs: Any) -> None:
-            calls.append(("write_clickhouse", kwargs))
-
-    import ray.data
-
-    monkeypatch.setattr(ray.data, "SinkMode", SimpleNamespace(APPEND="append"))
+    monkeypatch.setattr(inference, "default_write_gateway", Gateway)
     receipt = sink.write(Dataset(), run_id="inference-1", plan_digest="a" * 64)
 
     assert [name for name, _kwargs in calls] == [
         "map_batches",
         "materialize",
-        "count",
-        "write_clickhouse",
     ]
-    write = calls[3][1]
-    assert write["table"] == "analytics.ml_inference_result"
-    assert write["mode"] == "append"
-    assert write["max_insert_block_rows"] == 500
+    write_request, handle = writes[0]
+    assert write_request.binding_id == "tributo.ray.clickhouse"
+    assert write_request.target == (
+        "clickhouse://clickhouse:8123/analytics/ml_inference_result"
+    )
+    assert handle.dataset.__class__ is Dataset
     assert receipt.rows_written == 7
+    assert receipt.metadata["binding_id"] == "tributo.ray.clickhouse"
     assert _SECRET not in receipt.model_dump_json()
 
 
@@ -607,16 +628,18 @@ def test_tree_shap_sink_releases_predictor_actors_before_attribution(
             calls.append("materialize")
             return self
 
-        def count(self) -> int:
-            calls.append("count")
-            return 1
-
-        def write_clickhouse(self, **_kwargs: Any) -> None:
-            calls.append("write")
+    class Gateway:
+        def execute(self, _request: Any, _handle: Any) -> Any:
+            calls.append("gateway")
+            return SimpleNamespace(
+                rows_written=1,
+                binding_id="tributo.ray.clickhouse",
+                committed=True,
+            )
 
     import ray.data
 
-    monkeypatch.setattr(ray.data, "SinkMode", SimpleNamespace(APPEND="append"))
+    monkeypatch.setattr(inference, "default_write_gateway", Gateway)
     monkeypatch.setattr(
         ray.data,
         "ActorPoolStrategy",
@@ -630,6 +653,5 @@ def test_tree_shap_sink_releases_predictor_actors_before_attribution(
         "map:_TreeShapBatch",
         "map:_protocol_batch",
         "materialize",
-        "count",
-        "write",
+        "gateway",
     ]

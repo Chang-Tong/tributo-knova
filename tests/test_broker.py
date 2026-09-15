@@ -128,9 +128,10 @@ def test_training_request_adapts_to_existing_broker_contract() -> None:
     assert request.request_digest is not None
     assert len(request.request_digest) == 64
     assert prepared.operation_payload["knova_request"]["job_id"] == "job-1"
-    assert prepared.operation_payload["knova_request"]["datasource"] == payload[
-        "datasource"
-    ]
+    assert (
+        prepared.operation_payload["knova_request"]["datasource"]
+        == payload["datasource"]
+    )
 
 
 def test_request_digest_ignores_json_formatting() -> None:

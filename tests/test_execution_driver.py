@@ -84,9 +84,9 @@ def _set_driver_environment(
     monkeypatch: pytest.MonkeyPatch,
     value: DriverInput,
 ) -> None:
-    encoded = base64.urlsafe_b64encode(
-        value.model_dump_json().encode("utf-8")
-    ).decode("ascii")
+    encoded = base64.urlsafe_b64encode(value.model_dump_json().encode("utf-8")).decode(
+        "ascii"
+    )
     monkeypatch.setenv("TRIBUTO_REDIS_DRIVER_INPUT_B64", encoded)
     monkeypatch.setenv("TRIBUTO_SUBMISSION_ID", "submission-1")
     monkeypatch.setenv("TRIBUTO_ATTEMPT_ID", value.attempt_id)

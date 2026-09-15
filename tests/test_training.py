@@ -241,7 +241,7 @@ def test_execute_training_maps_knova_to_public_tributo_contracts(
 ) -> None:
     dispatcher = _Dispatcher()
     reporter = _Reporter()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
 
     result = training.execute_training(_request(), reporter)
 
@@ -284,12 +284,13 @@ def test_execute_training_maps_knova_to_public_tributo_contracts(
 
     ingestion_request = call["ingestion_request"]
     assert ingestion_request.engine == "tributo.ray_data"
-    assert ingestion_request.binding_id == "tributo.knova.ray.clickhouse"
+    assert ingestion_request.binding_id == "ray_clickhouse.ray.clickhouse"
     source = ingestion_request.source
     assert isinstance(source, ProviderSourceConfig)
     assert source.provider == "tributo.clickhouse"
     assert source.options["table"] == "analytics.churn_training_features"
     assert source.options["columns"] == ["active_days", "spend", "is_churn"]
+    assert "password" not in source.options
     assert "sql" not in source.options
     assert "secret_raw_sql" not in repr(ingestion_request)
     assert _SECRET not in source.uri
@@ -403,7 +404,7 @@ def test_s3_requires_explicit_ray_storage_and_maps_bundle_uri(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatcher = _Dispatcher()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     storage = {
         "type": "s3",
         "bucket": "knova-models",
@@ -474,7 +475,7 @@ def test_completed_event_rejects_mismatched_bundle_identity(
 ) -> None:
     dispatcher = _Dispatcher()
     reporter = _Reporter()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     monkeypatch.setattr(
         training,
         "load_bundle",
@@ -542,7 +543,7 @@ def test_completed_event_maps_real_primary_metric_without_fabrication(
         "invalid": float("nan"),
         "flag": True,
     }
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     reporter = _Reporter()
 
     training.execute_training(
@@ -584,7 +585,7 @@ def test_task_type_and_label_mapping_select_xgboost_objective(
     expected: dict[str, Any],
 ) -> None:
     dispatcher = _Dispatcher()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     target = {
         "origin": {"column_name": "label"},
         "task_type": task_type,
@@ -601,7 +602,7 @@ def test_unsupported_algorithm_is_rejected_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatcher = _Dispatcher()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     algorithm = {"algorithm_key": "lightgbm", "hyper_params": {}}
 
     with pytest.raises(ValueError, match="only algorithm_key=xgboost") as captured:
@@ -615,7 +616,7 @@ def test_clickhouse_requires_native_table_and_never_falls_back_to_sql(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatcher = _Dispatcher()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     datasource = {
         "type": "CLICKHOUSE",
         "host": "clickhouse",
@@ -635,7 +636,7 @@ def test_clickhouse_maps_knova_simple_direct_query_to_native_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatcher = _Dispatcher()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     datasource = {
         "type": "CLICKHOUSE",
         "host": "clickhouse",
@@ -693,7 +694,7 @@ def test_clickhouse_rejects_nontrivial_direct_query_without_native_table(
     monkeypatch: pytest.MonkeyPatch, sql: str
 ) -> None:
     dispatcher = _Dispatcher()
-    monkeypatch.setattr(training, "run_training", dispatcher)
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
     datasource = {
         "type": "CLICKHOUSE",
         "host": "clickhouse",
@@ -729,7 +730,7 @@ def test_dispatcher_error_is_sanitized(
         def __call__(self, **_kwargs: Any) -> None:
             raise RuntimeError(_SECRET)
 
-    monkeypatch.setattr(training, "run_training", _FailingDispatcher())
+    monkeypatch.setattr(training, "run_xgboost_training", _FailingDispatcher())
 
     with pytest.raises(RuntimeError) as captured:
         training.execute_training(_request(), _Reporter())

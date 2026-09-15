@@ -19,8 +19,10 @@ from tributo.data import (
     FilterEq,
     IngestionRequest,
     ProviderSourceConfig,
+    RayDataHandle,
     ReadOptions,
     TransformPipeline,
+    default_write_gateway,
 )
 from tributo.exceptions import ResultMaterializationError, ResultWriteError
 from tributo.inference import (
@@ -36,11 +38,13 @@ from tributo.inference import (
 )
 from tributo.inference.contracts import ResultSinkReceipt
 
-from tributo_knova.clickhouse import _dsn, _qualified_table
 from tributo_knova.protocol import InferenceExecutionRequest
 
-_CLICKHOUSE_BINDING_ID = "tributo.knova.ray.clickhouse"
+_CLICKHOUSE_BINDING_ID = "ray_clickhouse.ray.clickhouse"
+_CLICKHOUSE_WRITE_BINDING_ID = "tributo.ray.clickhouse"
+_OUTPUT_PASSWORD_ENV = "KNOVA_OUTPUT_CLICKHOUSE_PASSWORD"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FROM = re.compile(
     r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)"
     r"(?:\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*))?",
@@ -97,6 +101,12 @@ def _identifier(value: object, field: str) -> str:
     if _IDENTIFIER.fullmatch(result) is None:
         _invalid(f"{field} must be a SQL identifier")
     return result
+
+
+def _qualified_table(database: str, table: str) -> str:
+    database_name = _identifier(database, "ClickHouse database")
+    table_name = _identifier(table, "ClickHouse table")
+    return f"{database_name}.{table_name}"
 
 
 def _positive_int(value: object, field: str, default: int) -> int:
@@ -387,33 +397,36 @@ def _query_filters(
     return tuple(filters)
 
 
-def _credentials(datasource: Mapping[str, Any]) -> tuple[str, str]:
+def _credentials(
+    datasource: Mapping[str, Any],
+    *,
+    inline_password_env: str,
+) -> tuple[str, str, str]:
     username = str(datasource.get("username") or "")
     password = datasource.get("password")
+    password_env = inline_password_env
     if password is None:
         reference = datasource.get("credential_ref")
         if isinstance(reference, str) and reference.startswith("env://"):
-            password = os.environ.get(reference.removeprefix("env://"), "")
+            password_env = reference.removeprefix("env://")
+            if _ENV_NAME.fullmatch(password_env) is None:
+                _invalid("ClickHouse credential_ref must name an environment variable")
+            password = os.environ.get(password_env, "")
+        elif reference is not None:
+            _invalid("ClickHouse credential_ref must use env://VARIABLE")
         else:
             password = os.environ.get("TRIBUTO_CLICKHOUSE_PASSWORD", "")
     if not isinstance(password, str):
         _invalid("ClickHouse password must be a string or env credential reference")
-    return username, password
+    return username, password, password_env
 
 
 @contextmanager
-def _input_environment(username: str, password: str) -> Iterator[None]:
-    names = {
-        "TRIBUTO_CLICKHOUSE_USER": username,
-        "TRIBUTO_CLICKHOUSE_PASSWORD": password,
-    }
+def _runtime_environment(names: Mapping[str, str]) -> Iterator[None]:
     previous = {name: os.environ.get(name) for name in names}
     try:
         for name, value in names.items():
-            if value:
-                os.environ[name] = value
-            else:
-                os.environ.pop(name, None)
+            os.environ[name] = value
         yield
     finally:
         for name, value in previous.items():
@@ -465,7 +478,7 @@ def _build_request(
     *,
     measured_rows: int | None = None,
     batch_size_override: int | None = None,
-) -> tuple[InferenceRequest, _ClickHouseResultSink, tuple[str, str]]:
+) -> tuple[InferenceRequest, _ClickHouseResultSink, dict[str, str]]:
     payload = request.model_dump(mode="python")
     model = _mapping(payload.get("model"), "model")
     input_value = _mapping(payload.get("input"), "input")
@@ -485,7 +498,10 @@ def _build_request(
         properties.get("http_port", port), "input ClickHouse HTTP port", 8123
     )
     database = table.split(".", 1)[0]
-    username, password = _credentials(datasource)
+    username, password, _input_password_env = _credentials(
+        datasource,
+        inline_password_env="TRIBUTO_CLICKHOUSE_PASSWORD",
+    )
     columns = list(
         dict.fromkeys(
             (entity_column, *features, *(step.column for step in transforms.steps))
@@ -574,11 +590,31 @@ def _build_request(
         output_database,
         _identifier(output.get("table_name"), "output.table_name"),
     )
-    output_username, output_password = _credentials(output_datasource)
+    output_username, output_password, output_password_env = _credentials(
+        output_datasource,
+        inline_password_env=_OUTPUT_PASSWORD_ENV,
+    )
+    uri_host = (
+        f"[{output_host}]"
+        if ":" in output_host and not output_host.startswith("[")
+        else output_host
+    )
     sink_request = DataWriteTargetRequest(
         target_kind="clickhouse",
-        target=output_table,
+        target=(
+            f"clickhouse://{uri_host}:{output_port}/"
+            f"{output_database}/{output_table.split('.', 1)[1]}"
+        ),
+        binding_id=_CLICKHOUSE_WRITE_BINDING_ID,
         mode="append",
+        options={
+            "batch_rows": sink_batch_size,
+            "concurrency": concurrency,
+        },
+        runtime_options={
+            "user": output_username or "default",
+            "credential_ref": f"env://{output_password_env}",
+        },
     )
     core_request = InferenceRequest(
         model=model_reference,
@@ -615,12 +651,7 @@ def _build_request(
         run_id=request.execution_id,
     )
     sink = _ClickHouseResultSink(
-        host=output_host,
-        port=output_port,
-        database=output_database,
-        table=output_table,
-        username=output_username,
-        password=output_password,
+        target=sink_request,
         request=request,
         entity_column=entity_column,
         feature_columns=features,
@@ -630,7 +661,15 @@ def _build_request(
         explanation=explanation,
         model_reference=attribution_model_reference,
     )
-    return core_request, sink, (username, password)
+    return (
+        core_request,
+        sink,
+        {
+            "TRIBUTO_CLICKHOUSE_USER": username,
+            "TRIBUTO_CLICKHOUSE_PASSWORD": password,
+            output_password_env: output_password,
+        },
+    )
 
 
 def _execution_policy(
@@ -704,7 +743,7 @@ def _parameter_type(value: object) -> str:
 
 def _measure_input_rows(
     request: InferenceRequest,
-    credentials: tuple[str, str],
+    credentials: Mapping[str, str],
 ) -> int:
     import clickhouse_connect
 
@@ -730,8 +769,8 @@ def _measure_input_rows(
         host=host,
         port=port,
         database=database,
-        username=credentials[0],
-        password=credentials[1],
+        username=credentials["TRIBUTO_CLICKHOUSE_USER"],
+        password=credentials["TRIBUTO_CLICKHOUSE_PASSWORD"],
     )
     try:
         return int(client.query(sql, parameters=parameters).first_row[0])
@@ -1014,12 +1053,7 @@ class _ClickHouseResultSink:
     def __init__(
         self,
         *,
-        host: str,
-        port: int,
-        database: str,
-        table: str,
-        username: str,
-        password: str,
+        target: DataWriteTargetRequest,
         request: InferenceExecutionRequest,
         entity_column: str,
         feature_columns: tuple[str, ...],
@@ -1029,12 +1063,7 @@ class _ClickHouseResultSink:
         explanation: Mapping[str, Any] | None,
         model_reference: BundleModelReference | ArtifactModelReference,
     ) -> None:
-        self._host = host
-        self._port = port
-        self._database = database
-        self._table = table
-        self._username = username
-        self._password = password
+        self._target = target
         self._task = request.model_dump(mode="python")
         self._entity_column = entity_column
         self._feature_columns = feature_columns
@@ -1087,35 +1116,32 @@ class _ClickHouseResultSink:
                 },
             )
             transformed = transformed.materialize()
-            rows_written = transformed.count()
         except Exception as exc:
             raise ResultMaterializationError(type(exc).__name__) from None
         try:
-            transformed.write_clickhouse(
-                table=self._table,
-                dsn=_dsn(
-                    host=self._host,
-                    port=self._port,
-                    database=self._database,
-                    user=self._username,
-                    password=self._password,
-                ),
-                mode=ray.data.SinkMode.APPEND,
-                max_insert_block_rows=self._batch_size,
+            write_receipt = default_write_gateway().execute(
+                self._target.as_write_request(),
+                RayDataHandle(transformed),
             )
         except Exception as exc:
             raise ResultWriteError(
                 f"ClickHouse result write failed ({type(exc).__name__})"
             ) from None
+        if write_receipt.rows_written is None:
+            raise ResultWriteError("ClickHouse result write returned no row count")
         result_id = hashlib.sha256(
-            f"{run_id}|{plan_digest}|{self._table}".encode()
+            f"{run_id}|{plan_digest}|{self._target.target}".encode()
         ).hexdigest()
         return ResultSinkReceipt(
             sink_id=self.sink_id,
             result_id=result_id,
-            uri=f"clickhouse://{self._host}:{self._port}/{self._table}",
-            rows_written=rows_written,
-            metadata={"target_kind": "clickhouse", "committed": "true"},
+            uri=self._target.target,
+            rows_written=write_receipt.rows_written,
+            metadata={
+                "target_kind": "clickhouse",
+                "binding_id": write_receipt.binding_id,
+                "committed": str(write_receipt.committed).lower(),
+            },
         )
 
 
@@ -1150,7 +1176,7 @@ def execute_inference(
         )
         retries = 0
         while True:
-            with _input_environment(*input_credentials):
+            with _runtime_environment(input_credentials):
                 result = run_inference(core_request, bound_sink=sink)
             failure = result.failure
             if (

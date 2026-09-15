@@ -4,8 +4,8 @@ KnoVa integration package built on the public `tributo` and
 `tributo-broker-redis` packages.
 
 This repository starts as a thin integration layer. It should reuse the two
-upstream packages directly and add only KnoVa protocol mapping, missing runtime
-behavior, and deployment assets.
+upstream packages and the official algorithm packages directly, adding only
+KnoVa protocol mapping, application policy, and deployment assets.
 
 The current implementation accepts the existing KnoVa protocol v2 training and
 batch-inference envelopes and adapts them to the public Redis broker runtime.
@@ -16,7 +16,9 @@ XGBoost UBJ flavor, split-aware terminal evaluation, live round metrics,
 feature importance, and distributed feature correlation, plus KnoVa v2
 lifecycle events. Redis Streams consumption, consumer groups, pending recovery,
 cancellation, Ray Job admission, retries, and acknowledgements remain owned by
-`tributo-broker-redis`.
+`tributo-broker-redis`. The distributed XGBoost train/evaluate/checkpoint/Bundle
+data plane is owned by `tributo-algorithms-boosting`; KnoVa only maps the request,
+invokes that public API, and projects its result into the KnoVa protocol.
 
 See [the implementation plan](docs/implementation-plan.md) for the completed
 vertical slices and the remaining upstream limits. See the
@@ -24,34 +26,22 @@ vertical slices and the remaining upstream limits. See the
 branch is not a 1.0 release yet: cross-restart checkpoint resume, direct
 UBJ-only prediction, and compatible upstream release tags remain open.
 
-## ClickHouse parallel reads
+## ClickHouse data path
 
-Training and inference share one Tributo ingestion Binding. It imports
-`ray-clickhouse` for bounded Arrow streaming and disjoint physical-partition or
-integer-range reads, while all execution still uses Ray's public Datasource API.
-For inference, each emitted source block is capped at 200,000 rows and 64 MiB;
-the measured input row count determines the requested number of range tasks.
-Leading equality predicates are sent to ClickHouse as bound parameters and are
-recorded as exact Tributo pushdowns.
+Training and inference use Tributo's official
+`ray_clickhouse.ray.clickhouse` ingestion Binding. Tributo owns the typed
+control-plane request, `ray-clickhouse` owns physical split discovery and
+bounded Arrow streaming, and Ray Data owns execution. KnoVa only maps protocol
+fields to the public request and selects application-level batch/concurrency
+policy. Equality filters remain explicit Tributo transforms, so correctness
+does not depend on a KnoVa-specific SQL pushdown implementation.
 
-For Tributo `auto` partitioning, KnoVa reads the table engine, active physical
-partitions, sorting key, and first key type. Multiple physical partitions are
-balanced by on-disk bytes. Otherwise an integer first sorting column creates
-disjoint range tasks. With a composite key, only its first integer column is
-needed for row coverage; the remaining columns do not need to be discarded or
-invented as independent split keys.
-
-When a simple sorting key exists but its first column is not an integer, KnoVa
-retains `ray.data.read_clickhouse(order_by=...)` so existing parallel ordered
-reads keep working. A key such as `tenant_id, event_time, user_id` is passed in
-its original order. This fallback uses Ray's native global ORDER BY/OFFSET
-implementation.
-
-Sorting-key SQL expressions are not passed through as arbitrary SQL. If neither
-physical partitions nor an integer range key is available, the Binding uses one
-bounded streaming task and emits a single-worker pressure warning. If metadata
-itself is unavailable, it falls back to Ray's native single-task reader. KnoVa
-does not invent unsafe split predicates that could duplicate or omit rows.
+Inference output keeps KnoVa's result projection and TreeSHAP formatting in the
+application layer, then hands the transformed Ray Dataset to Tributo's
+`WriteGateway` with the official `tributo.ray.clickhouse` append Binding.
+KnoVa no longer registers a parallel ingestion Binding or calls a ClickHouse
+writer directly. Input and output credentials are carried as environment
+references and never enter the public Core request or receipt.
 
 ## Development
 

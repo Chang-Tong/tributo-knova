@@ -11,8 +11,8 @@ own.
 | --- | --- |
 | Algorithm execution, ingestion contracts, inference, Bundle and export | `tributo` |
 | Redis Streams, consumer groups, pending recovery, retry, cancellation and Ray Job admission | `tributo-broker-redis` |
-| KnoVa protocol v2 mapping, event compatibility, ClickHouse extensions and deployment defaults | `tributo-knova` |
-| XGBoost implementation, ONNX and UBJ exporters | official `tributo-algorithms-boosting` package |
+| KnoVa protocol v2 mapping, event compatibility, ClickHouse request/result policy and deployment defaults | `tributo-knova` |
+| Distributed XGBoost split/train/evaluate/checkpoint/Bundle runtime, ONNX and UBJ exporters | official `tributo-algorithms-boosting` package |
 
 KnoVa code should call these public contracts directly. It should not copy the
 Redis consumer or create a parallel training/inference API.
@@ -52,7 +52,8 @@ the pinned official boosting implementation explicitly rejects `resume_from`
 until its separate recovery gate is available.
 
 - Map the existing training request to Tributo's formal algorithm execution
-  contracts and use `tributo-algorithms-boosting` for distributed XGBoost.
+  contracts and invoke `tributo-algorithms-boosting.run_xgboost_training`.
+  KnoVa does not own a duplicate training runtime.
 - Map NAS/NFS `storage_context` to Ray checkpoint storage and map final model
   storage to Tributo Bundle publication.
 - Publish ONNX and UBJ model variants plus the Bundle manifest and metadata
@@ -67,14 +68,15 @@ until its separate recovery gate is available.
 Acceptance: two-worker training produces ONNX and UBJ artifacts, persists a
 shared checkpoint, uploads and reloads the final Bundle through S3, and emits
 one KnoVa terminal event. Cross-restart resume is deferred until the upstream
-boosting recovery gate exists. A physical `metrics.json` and non-empty terminal
-evaluation remain deferred until the official execution/export contracts
-provide real evaluation data; KnoVa does not fabricate metrics.
+boosting recovery gate exists. Full terminal evaluation now comes from the
+official boosting runtime; KnoVa projects those metrics without recomputing or
+fabricating them. A separate physical `metrics.json` artifact remains deferred
+until it is part of an upstream exporter contract.
 
 ## Milestone 3 — batch inference and ClickHouse
 
 Status: Ray-native ClickHouse reads, ONNX Bundle inference, protocol-v2 result
-mapping, ClickHouse writes, filter pushdown, and exact terminal row counts are
+mapping, ClickHouse writes, residual equality filters, and exact terminal row counts are
 implemented and covered by the local end-to-end smoke test. Measured-row
 adaptive batch sizing and bounded pre-write memory-pressure retries are also
 implemented. Exact and explicitly marked approximate TreeSHAP use the official
@@ -82,12 +84,13 @@ Bundle native role/UBJ model after public Tributo ONNX prediction; both modes
 are covered by the same end-to-end smoke test. Direct UBJ-only prediction
 remains open because the current upstream native predictor drops feature names.
 
-- Implement a KnoVa-owned Ray-native ClickHouse ingestion Binding through
-  Tributo's `tributo.ingestion_bindings` entry point.
+- Map KnoVa input to Tributo's official `ray_clickhouse.ray.clickhouse`
+  ingestion Binding; physical splits and bounded streaming remain owned by the
+  connector.
 - Route inference output through Tributo's existing `BoundResultSink` extension
-  point and `data-write-v1` receipt contract. The sink delegates to Ray's native
-  ClickHouse writer and keeps credentials out of the public Core request and
-  receipt.
+  point and `data-write-v1` receipt contract. The KnoVa sink owns only protocol
+  projection and delegates the terminal write to Tributo's `WriteGateway` and
+  `tributo.ray.clickhouse` Binding.
 - Map the protocol's ONNX and XGBoost alternatives to Tributo's existing
   Bundle inference runtime. Use ONNX for prediction and the official UBJ native
   role for exact or explicitly approximate TreeSHAP.
