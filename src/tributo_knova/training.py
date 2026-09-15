@@ -33,6 +33,7 @@ from tributo_knova.protocol import TrainingExecutionRequest
 
 _CLICKHOUSE_BINDING_ID = "ray_clickhouse.ray.clickhouse"
 _INPUT_REFERENCE = "knova.training.input"
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHARED_STORAGE_TYPES = frozenset({"nfs", "nas", "shared_fs"})
 _CONTROL_HYPER_PARAMETERS = frozenset(
@@ -72,6 +73,24 @@ def _text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         _invalid(f"{field} must be a non-empty string")
     return value.strip()
+
+
+def _native_table_name(value: str, database: str) -> str:
+    parts = value.split(".")
+    if len(parts) == 1:
+        table = parts[0]
+    elif len(parts) == 2:
+        table_database, table = parts
+        if table_database != database:
+            _invalid(
+                "datasource.properties.native_table database must match "
+                "datasource.database_name"
+            )
+    else:
+        _invalid("datasource.properties.native_table must be table or database.table")
+    if _IDENTIFIER.fullmatch(database) is None or _IDENTIFIER.fullmatch(table) is None:
+        _invalid("ClickHouse database and table must be simple identifiers")
+    return table
 
 
 def _positive_int(value: object, field: str) -> int:
@@ -418,6 +437,7 @@ def _ingestion_invocation(
     )
     host = _text(datasource.get("host"), "datasource.host")
     database = _text(datasource.get("database_name"), "datasource.database_name")
+    table_name = _native_table_name(native_table, database)
     port = _positive_int(datasource.get("port", 8123), "datasource.port")
     if port > 65535:
         _invalid("datasource.port must be no greater than 65535")
@@ -426,7 +446,7 @@ def _ingestion_invocation(
     uri_host = host if ":" not in host or host.startswith("[") else f"[{host}]"
 
     options: dict[str, Any] = {
-        "table": native_table,
+        "table": table_name,
         "host": host,
         "port": port,
         "database": database,

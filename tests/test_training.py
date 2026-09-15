@@ -288,7 +288,7 @@ def test_execute_training_maps_knova_to_public_tributo_contracts(
     source = ingestion_request.source
     assert isinstance(source, ProviderSourceConfig)
     assert source.provider == "tributo.clickhouse"
-    assert source.options["table"] == "analytics.churn_training_features"
+    assert source.options["table"] == "churn_training_features"
     assert source.options["columns"] == ["active_days", "spend", "is_churn"]
     assert "password" not in source.options
     assert "sql" not in source.options
@@ -670,9 +670,7 @@ def test_clickhouse_maps_knova_simple_direct_query_to_native_table(
     )
 
     ingestion_request = dispatcher.calls[0]["ingestion_request"]
-    assert ingestion_request.source.options["table"] == (
-        "analytics.churn_training_features"
-    )
+    assert ingestion_request.source.options["table"] == "churn_training_features"
     assert "sql" not in ingestion_request.source.options
 
 

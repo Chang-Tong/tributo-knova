@@ -7,10 +7,10 @@ still come from the configured Python package index.
 
 | Wheel | Source commit | SHA-256 |
 | --- | --- | --- |
-| `ray_clickhouse-0.1.0-py3-none-any.whl` | `jiangxt2/ray-clickhouse@418f6c9608b61228986e6d247e604f36856307ba` | `55dc41f0699b5ee80beb871ef1718094db6faddeddbdfe42a57a8ea45327ad30` |
-| `tributo-1.0.0-py3-none-any.whl` | `jiangxt2/Tributo@8cf821a22267e4972075d576eedacf3735f3d330` | `8095676906382aded3b31a9ea987d18d1cea2f5d131684a691862924321e949a` |
-| `tributo_algorithms_boosting-0.1.0-py3-none-any.whl` | `jiangxt2/tributo-algorithms@71a6a16c3fd3676aba2225a0c528817634927fc7` (`packages/boosting`) | `d4ff909290fa1d2c46b92ff0a2151efcac8231d8ff01fc02f6675da1f5c17b24` |
-| `tributo_broker_redis-0.1.0-py3-none-any.whl` | `Chang-Tong/tributo-broker-redis@41a193b7b9215e332d82b67abf72315e99d18b45` | `d2a6bb1a230506347ef5c85b08040597a2f082c1b13460b6f676c9d2f00ec11d` |
+| `ray_clickhouse-0.1.0-py3-none-any.whl` | `Chang-Tong/ray-clickhouse-upstream@c1627101736463ccc94c99c6793f91360173e6ac` | `422495c3d89555c641fafcbcbd4383513402b4d6973c0e575de51070a694c1a4` |
+| `tributo-1.0.0-py3-none-any.whl` | `Chang-Tong/Tributo@440da0422a3a9c5b041b6ecdbb2e40c00bf43cd90` | `38c095e3812deabc16280281fb4ab06b5c4d53f09f94d751af945b8b76dc13f2` |
+| `tributo_algorithms_boosting-0.1.0-py3-none-any.whl` | `Chang-Tong/tributo-algorithms@6f39378d4d850cfd41e9510abc313efc6d4f209f` (`packages/boosting`) | `78ecd95a05f8f33ea546fe9b9496c9d4a46eb85ed5f4f9b6a207132861cb45d7` |
+| `tributo_broker_redis-0.1.0-py3-none-any.whl` | `Chang-Tong/tributo-broker-redis@05b4ef6ca557ed3b6373ec9cfc9cc1be3648330bd` | `8db95dc7e72ddf3153cdf3b670782a4bcca5865b39a359b24a2dd737bcdd9fbe` |
 
 Rebuild the wheels with Python 3.13 whenever one of those locked commits
 changes, update the hashes above, and verify that every filename still ends in

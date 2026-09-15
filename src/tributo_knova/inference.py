@@ -109,6 +109,13 @@ def _qualified_table(database: str, table: str) -> str:
     return f"{database_name}.{table_name}"
 
 
+def _native_table_name(value: str, database: str) -> str:
+    parts = value.split(".")
+    if len(parts) != 2 or parts[0] != database:
+        _invalid("input table must use the same database as its datasource")
+    return _identifier(parts[1], "input table name")
+
+
 def _positive_int(value: object, field: str, default: int) -> int:
     raw = default if value is None else value
     if not isinstance(raw, int) or isinstance(raw, bool) or raw < 1:
@@ -498,6 +505,7 @@ def _build_request(
         properties.get("http_port", port), "input ClickHouse HTTP port", 8123
     )
     database = table.split(".", 1)[0]
+    table_name = _native_table_name(table, database)
     username, password, _input_password_env = _credentials(
         datasource,
         inline_password_env="TRIBUTO_CLICKHOUSE_PASSWORD",
@@ -522,7 +530,7 @@ def _build_request(
         provider="tributo.clickhouse",
         uri=f"clickhouse://{host}:{port}/{database}",
         options={
-            "table": table,
+            "table": table_name,
             "host": host,
             "port": port,
             "database": database,

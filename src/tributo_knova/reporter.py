@@ -117,6 +117,10 @@ class KnovaRedisEventReporter(RedisEventReporter):
             self._terminal = True
         return event
 
+    def metrics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Project the public training reporter callback into a KnoVa event."""
+        return self.publish("METRICS", payload, phase="EXECUTING")
+
     def _training_event(
         self,
         event_type: str,

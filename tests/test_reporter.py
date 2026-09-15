@@ -50,6 +50,36 @@ def test_training_failure_uses_current_v2_envelope() -> None:
     }
 
 
+def test_training_metrics_callback_uses_current_v2_envelope() -> None:
+    redis = _Redis()
+    reporter = KnovaRedisEventReporter(
+        redis,
+        event_stream_prefix="events:training",
+        operation_id="job-1",
+        operation_type="training",
+        execution_profile="distributed",
+        run_id="job-1",
+        attempt_id="attempt-1",
+        outer_identity_field="job_id",
+    )
+
+    reporter.metrics(
+        {
+            "current_round": 2,
+            "total_rounds": 10,
+            "progress_percent": 20.0,
+            "metrics": [{"metric_name": "logloss", "train": 0.4}],
+        }
+    )
+
+    event = _event(redis)
+    assert event["event_type"] == "METRICS"
+    assert event["phase"] == "TRAINING"
+    assert event["current_round"] == 2
+    assert event["total_rounds"] == 10
+    assert event["metrics"] == [{"metric_name": "logloss", "train": 0.4}]
+
+
 def test_inference_admission_uses_current_v2_log_event() -> None:
     redis = _Redis()
     reporter = KnovaRedisEventReporter(

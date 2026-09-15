@@ -116,7 +116,7 @@ def test_build_request_uses_public_inference_contract_without_credentials() -> N
     assert core.model.kind == "bundle"
     assert core.input.engine == "tributo.ray_data"
     assert core.input.binding_id == "ray_clickhouse.ray.clickhouse"
-    assert core.input.source.options["table"] == "analytics.features"
+    assert core.input.source.options["table"] == "features"
     assert core.input.source.options["columns"] == [
         "user_id",
         "spend",
