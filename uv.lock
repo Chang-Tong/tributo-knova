@@ -1502,7 +1502,7 @@ tune = [
 [[package]]
 name = "ray-clickhouse"
 version = "0.1.0"
-source = { git = "https://github.com/jiangxt2/ray-clickhouse.git?rev=ddcfc7d2f46fd4151f649f588ea98a51f91b2f7b#ddcfc7d2f46fd4151f649f588ea98a51f91b2f7b" }
+source = { git = "https://github.com/Chang-Tong/ray-clickhouse-upstream.git?rev=c1627101736463ccc94c99c6793f91360173e6ac#c1627101736463ccc94c99c6793f91360173e6ac" }
 dependencies = [
     { name = "clickhouse-connect", extra = ["arrow"] },
     { name = "pyarrow" },
@@ -1838,7 +1838,7 @@ requires-dist = [
     { name = "clickhouse-connect", specifier = ">=1.5,<1.6" },
     { name = "pydantic", specifier = ">=2.0,<3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "ray-clickhouse", git = "https://github.com/jiangxt2/ray-clickhouse.git?rev=ddcfc7d2f46fd4151f649f588ea98a51f91b2f7b" },
+    { name = "ray-clickhouse", git = "https://github.com/Chang-Tong/ray-clickhouse-upstream.git?rev=c1627101736463ccc94c99c6793f91360173e6ac" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6,<1.0" },
     { name = "tributo", git = "https://github.com/Chang-Tong/Tributo.git?rev=440da0422a3a9c5b041b6ecdbb2e40c00bf43cd90" },
     { name = "tributo-algorithms-boosting", git = "https://github.com/Chang-Tong/tributo-algorithms.git?subdirectory=packages%2Fboosting&rev=6f39378d4d850cfd41e9510abc313efc6d4f209f" },

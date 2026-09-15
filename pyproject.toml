@@ -8,7 +8,7 @@ dependencies = [
     "boto3>=1.42.91",
     "clickhouse-connect>=1.5,<1.6",
     "pydantic>=2.0,<3.0",
-    "ray-clickhouse @ git+https://github.com/jiangxt2/ray-clickhouse.git@ddcfc7d2f46fd4151f649f588ea98a51f91b2f7b",
+    "ray-clickhouse @ git+https://github.com/Chang-Tong/ray-clickhouse-upstream.git@c1627101736463ccc94c99c6793f91360173e6ac",
     "tributo @ git+https://github.com/Chang-Tong/Tributo.git@440da0422a3a9c5b041b6ecdbb2e40c00bf43cd90",
     "tributo-algorithms-boosting @ git+https://github.com/Chang-Tong/tributo-algorithms.git@6f39378d4d850cfd41e9510abc313efc6d4f209f#subdirectory=packages/boosting",
     "tributo-broker-redis @ git+https://github.com/Chang-Tong/tributo-broker-redis.git@05b4ef6ca557ed3b6373ec9cfc9cc1be3648330bd",
