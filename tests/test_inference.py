@@ -123,10 +123,7 @@ def test_build_request_uses_public_inference_contract_without_credentials() -> N
         "active_days",
         "stat_month",
     ]
-    assert core.input.source.options["partitioning"] == {
-        "mode": "auto",
-        "num_partitions": 3,
-    }
+    assert core.input.source.options["partitioning"] == {"mode": "single"}
     assert core.input.read_options.batch_size == 200_000
     assert core.input.read_options.target_split_size_bytes == 64 * 1024 * 1024
     assert core.input.read_options.concurrency == 3
@@ -289,6 +286,27 @@ def test_complex_query_is_rejected_without_executing_raw_sql() -> None:
     assert _SECRET not in str(captured.value)
 
 
+def test_ordered_query_filter_repairs_numeric_string_bound() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["input"]["query"] = {
+        "sql": (
+            "SELECT t0.user_id, t0.spend, t0.active_days "
+            "FROM analytics.features AS t0 WHERE t0.user_id <= {p0:String}"
+        ),
+        "params": {"p0": "1000000"},
+    }
+
+    core, _sink, _credentials = inference._build_request(
+        InferenceExecutionRequest.model_validate(payload)
+    )
+
+    step = core.input.transforms.steps[0]
+    assert step.type == "filter_comparison"
+    assert step.column == "user_id"
+    assert step.operator == "lte"
+    assert step.value == 1_000_000
+
+
 def test_execute_inference_scopes_credentials_and_reports_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -378,7 +396,7 @@ def test_measured_rows_select_adaptive_batch_policy() -> None:
 
     assert core.execution.batch_size == 150_000
     assert core.execution.concurrency == 6
-    assert core.input.source.options["partitioning"]["num_partitions"] == 15
+    assert core.input.source.options["partitioning"] == {"mode": "single"}
     assert sink._batch_size == 50_000
 
 
@@ -402,7 +420,7 @@ def test_default_adaptive_batch_and_read_tasks_are_capped_at_200k_rows() -> None
     )
 
     assert core.execution.batch_size == 200_000
-    assert core.input.source.options["partitioning"]["num_partitions"] == 50
+    assert core.input.source.options["partitioning"] == {"mode": "single"}
     assert core.input.read_options.batch_size == 200_000
     assert core.input.read_options.target_split_size_bytes == 64 * 1024 * 1024
 
@@ -478,6 +496,7 @@ def test_protocol_batch_maps_binary_result_schema() -> None:
     assert result["entity_id"].tolist() == ["11", ""]
     assert result["pred_label"].tolist() == ["active", "churn"]
     assert result["pred_probability"].tolist() == [0.2, 0.9]
+    assert result["inferred_at"].dt.tz is None
     assert json.loads(result["pred_extra"][0]) == {
         "inference_feature_values": [
             {"feature_name": "t0__spend", "value": 10.5},

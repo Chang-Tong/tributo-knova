@@ -16,7 +16,9 @@ from typing import Any, NoReturn
 
 from tributo.data import (
     DataWriteTargetRequest,
+    FilterComparison,
     FilterEq,
+    FilterNotEq,
     IngestionRequest,
     ProviderSourceConfig,
     RayDataHandle,
@@ -54,9 +56,10 @@ _WHERE = re.compile(
     r"\bWHERE\s+(.+?)(?:\bORDER\s+BY\b|\bLIMIT\b|$)",
     re.IGNORECASE | re.DOTALL,
 )
-_EQUALITY = re.compile(
+_PREDICATE = re.compile(
     r"(?:([A-Za-z_][A-Za-z0-9_]*)\.)?([A-Za-z_][A-Za-z0-9_]*)"
-    r"\s*=\s*\{([A-Za-z_][A-Za-z0-9_]*):[A-Za-z0-9_(), ]+\}",
+    r"\s*(<=|>=|!=|<>|=|<|>)\s*"
+    r"\{([A-Za-z_][A-Za-z0-9_]*):[A-Za-z0-9_(), ]+\}",
     re.IGNORECASE,
 )
 _UNSUPPORTED_SQL = re.compile(
@@ -370,7 +373,7 @@ def _query_filters(
     *,
     table: str,
     alias: str,
-) -> tuple[FilterEq, ...]:
+) -> tuple[FilterEq | FilterNotEq | FilterComparison, ...]:
     if query_value is None:
         return ()
     query = _mapping(query_value, "input.query")
@@ -378,9 +381,7 @@ def _query_filters(
     if not sql:
         return ()
     if _UNSUPPORTED_SQL.search(sql):
-        _invalid(
-            "input.query supports only a single-table SELECT with equality filters"
-        )
+        _invalid("input.query supports only a single-table SELECT with scalar filters")
     source = _FROM.search(sql)
     if source is None or source.group(1).lower() != table.lower():
         _invalid("input.query FROM must match the PRIMARY table")
@@ -391,17 +392,51 @@ def _query_filters(
     if where is None:
         return ()
     params = _mapping(query.get("params", {}), "input.query.params")
-    filters: list[FilterEq] = []
+    filters: list[FilterEq | FilterNotEq | FilterComparison] = []
     for raw_condition in re.split(r"\s+AND\s+", where.group(1), flags=re.IGNORECASE):
         condition = raw_condition.strip().strip("()")
-        match = _EQUALITY.fullmatch(condition)
-        if match is None or match.group(1) not in (None, alias):
-            _invalid("input.query WHERE supports only parameterized equality filters")
-        parameter = match.group(3)
+        match = _PREDICATE.fullmatch(condition)
+        condition_alias = None if match is None else match.group(1)
+        if match is None or (
+            condition_alias is not None and condition_alias.lower() != alias.lower()
+        ):
+            _invalid("input.query WHERE supports only parameterized scalar filters")
+        parameter = match.group(4)
         if parameter not in params:
             _invalid("input.query WHERE references a missing parameter")
-        filters.append(FilterEq(column=match.group(2), value=params[parameter]))
+        column = match.group(2)
+        operator = match.group(3)
+        value = params[parameter]
+        if operator == "=":
+            filters.append(FilterEq(column=column, value=value))
+        elif operator in {"!=", "<>"}:
+            filters.append(FilterNotEq(column=column, value=value))
+        else:
+            filters.append(
+                FilterComparison(
+                    column=column,
+                    operator={"<": "lt", "<=": "lte", ">": "gt", ">=": "gte"}[
+                        operator
+                    ],
+                    value=_ordered_comparison_value(value),
+                )
+            )
     return tuple(filters)
+
+
+def _ordered_comparison_value(value: object) -> object:
+    """Repair KnoVa numeric bounds serialized as String query parameters."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if re.fullmatch(r"[+-]?\d+", stripped):
+        return int(stripped)
+    if re.fullmatch(
+        r"[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|[+-]?\d+[eE][+-]?\d+",
+        stripped,
+    ):
+        return float(stripped)
+    return value
 
 
 def _credentials(
@@ -520,12 +555,6 @@ def _build_request(
         measured_rows=measured_rows,
         batch_size_override=batch_size_override,
     )
-    read_partitions = concurrency
-    if measured_rows is not None and measured_rows > 0:
-        read_partitions = max(
-            concurrency,
-            math.ceil(measured_rows / _CLICKHOUSE_READ_TASK_ROWS),
-        )
     source = ProviderSourceConfig(
         provider="tributo.clickhouse",
         uri=f"clickhouse://{host}:{port}/{database}",
@@ -535,10 +564,10 @@ def _build_request(
             "port": port,
             "database": database,
             "columns": columns,
-            "partitioning": {
-                "mode": "auto",
-                "num_partitions": read_partitions,
-            },
+            # KnoVa points at ClickHouse Distributed tables. Ray's ClickHouse
+            # connector cannot split those tables by database partitions, so
+            # read through the coordinator and let Ray parallelize downstream.
+            "partitioning": {"mode": "single"},
         },
     )
     explanation = _explanation_options(payload)
@@ -746,7 +775,7 @@ def _parameter_type(value: object) -> str:
         return "Float64"
     if isinstance(value, str):
         return "String"
-    _invalid("input.query equality parameters must be scalar JSON values")
+    _invalid("input.query filter parameters must be scalar JSON values")
 
 
 def _measure_input_rows(
@@ -764,11 +793,21 @@ def _measure_input_rows(
     clauses: list[str] = []
     parameters: dict[str, object] = {}
     for index, step in enumerate(request.input.transforms.steps):
-        if not isinstance(step, FilterEq):
-            _invalid("adaptive row counting supports equality filters only")
         name = f"filter_{index}"
         column = _identifier(step.column, "input query filter column")
-        clauses.append(f"`{column}` = {{{name}:{_parameter_type(step.value)}}}")
+        if isinstance(step, FilterEq):
+            operator = "="
+        elif isinstance(step, FilterNotEq):
+            operator = "!="
+        elif isinstance(step, FilterComparison):
+            operator = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}[
+                step.operator
+            ]
+        else:
+            _invalid("adaptive row counting supports scalar filters only")
+        clauses.append(
+            f"`{column}` {operator} {{{name}:{_parameter_type(step.value)}}}"
+        )
         parameters[name] = step.value
     sql = f"SELECT count() FROM {table}"
     if clauses:
@@ -1038,7 +1077,11 @@ def _protocol_batch(
             "model_id": str(model.get("model_id") or ""),
             "version_id": str(model.get("version_id") or ""),
             "tenant_id": str(task.get("tenant_id") or ""),
-            "inferred_at": datetime.now(UTC),
+            # KnoVa's result table declares ClickHouse DateTime without a
+            # timezone. Preserve the UTC instant but emit a timezone-naive
+            # Arrow timestamp so the official ClickHouse binding can validate
+            # and write the column losslessly.
+            "inferred_at": datetime.now(UTC).replace(tzinfo=None),
         }
     )
     output = _mapping(task.get("output"), "output")
