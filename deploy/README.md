@@ -35,6 +35,9 @@ development. It does not start a second KnoVa control plane or copy the legacy
 closed-source runtime. Instead, it joins the existing external
 `knova-network`, consumes the distributed training and inference streams from
 Redis database 3, and submits the translated work to a dedicated Ray head.
+The devbox config uses dedicated consumer groups starting at `$`, so bringing
+up a developer sidecar cannot reclaim stale deliveries owned by an older
+runtime. Production configs retain their normal recovery-oriented groups.
 
 Start the KnoVa devbox infrastructure and its `ai-model` profile first. Redis,
 RustFS, ClickHouse, and `ai-model-control` must all be reachable on
