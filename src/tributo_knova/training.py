@@ -261,11 +261,17 @@ def _storage_config(payload: Mapping[str, Any]) -> tuple[str, str]:
     if storage_type == "s3":
         if "://" in bucket or "/" in bucket.strip("/"):
             _invalid("storage_context.bucket must be an S3 bucket name")
-        ray_storage_path = _absolute_shared_path(
-            properties.get("ray_storage_path"),
-            "storage_context.properties.ray_storage_path",
+        bundle_uri = f"s3://{bucket.strip('/')}/{prefix}"
+        configured_ray_path = properties.get("ray_storage_path")
+        ray_storage_path = (
+            _absolute_shared_path(
+                configured_ray_path,
+                "storage_context.properties.ray_storage_path",
+            )
+            if configured_ray_path
+            else f"{bundle_uri}/_ray-checkpoints"
         )
-        return ray_storage_path, f"s3://{bucket.strip('/')}/{prefix}"
+        return ray_storage_path, bundle_uri
 
     _invalid("storage_context.type must be nfs, nas, shared_fs, or s3")
 

@@ -400,7 +400,7 @@ def test_default_data_split_keeps_validation_and_test_sets() -> None:
     }
 
 
-def test_s3_requires_explicit_ray_storage_and_maps_bundle_uri(
+def test_s3_maps_explicit_ray_storage_and_bundle_uri(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatcher = _Dispatcher()
@@ -464,10 +464,20 @@ def test_s3_requires_explicit_ray_storage_and_maps_bundle_uri(
         "properties": {},
     }
 
-    storage["properties"] = {}
-    with pytest.raises(ValueError, match="ray_storage_path") as captured:
-        training.execute_training(_request(storage_context=storage), _Reporter())
-    assert _SECRET not in str(captured.value)
+
+
+def test_s3_defaults_ray_storage_below_requested_prefix() -> None:
+    storage = {
+        "type": "s3",
+        "bucket": "knova-models",
+        "prefix": "tenant-a/job-1",
+        "properties": {},
+    }
+
+    assert training._storage_config({"storage_context": storage}) == (
+        "s3://knova-models/tenant-a/job-1/_ray-checkpoints",
+        "s3://knova-models/tenant-a/job-1",
+    )
 
 
 def test_completed_event_rejects_mismatched_bundle_identity(
