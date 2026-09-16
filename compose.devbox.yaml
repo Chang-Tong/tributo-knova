@@ -1,0 +1,68 @@
+name: tributo-knova-devbox
+
+x-tributo-knova-image: &tributo-knova-image
+  image: ${TRIBUTO_KNOVA_IMAGE:-tributo-knova:devbox}
+  pull_policy: never
+
+x-tributo-knova-environment: &tributo-knova-environment
+  AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-knova}
+  AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-knova-dev-secret}
+  AWS_ENDPOINT_URL: http://rustfs:9000
+  AWS_REGION: ${RUSTFS_REGION:-cn-east-1}
+  AWS_EC2_METADATA_DISABLED: "true"
+
+services:
+  tributo-knova-ray:
+    <<: *tributo-knova-image
+    command:
+      - ray
+      - start
+      - --head
+      - --dashboard-host=0.0.0.0
+      - --dashboard-port=8265
+      - --num-cpus=${TRIBUTO_KNOVA_RAY_NUM_CPUS:-4}
+      - --disable-usage-stats
+      - --block
+    shm_size: ${TRIBUTO_KNOVA_RAY_SHM_SIZE:-6gb}
+    environment: *tributo-knova-environment
+    ports:
+      - "127.0.0.1:${TRIBUTO_KNOVA_RAY_DASHBOARD_PORT:-8265}:8265"
+    networks:
+      knova-network:
+        aliases:
+          - tributo-knova-ray
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8265/api/version', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  tributo-knova-consumer:
+    <<: *tributo-knova-image
+    init: true
+    command:
+      - tributo-knova
+      - consume
+      - --config
+      - /etc/tributo-knova/config.json
+    environment: *tributo-knova-environment
+    volumes:
+      - ./deploy/config/knova-devbox.json:/etc/tributo-knova/config.json:ro
+    networks:
+      - knova-network
+    depends_on:
+      tributo-knova-ray:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+networks:
+  knova-network:
+    external: true
+    name: knova-network
