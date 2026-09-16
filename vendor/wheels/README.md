@@ -9,7 +9,7 @@ still come from the configured Python package index.
 | --- | --- | --- |
 | `ray_clickhouse-0.1.0-py3-none-any.whl` | `Chang-Tong/ray-clickhouse-upstream@c1627101736463ccc94c99c6793f91360173e6ac` | `422495c3d89555c641fafcbcbd4383513402b4d6973c0e575de51070a694c1a4` |
 | `tributo-1.0.0-py3-none-any.whl` | `Chang-Tong/Tributo@440da0422a3a9c5b041b6ecdbb2e40c00bf43cd90` | `38c095e3812deabc16280281fb4ab06b5c4d53f09f94d751af945b8b76dc13f2` |
-| `tributo_algorithms_boosting-0.1.0-py3-none-any.whl` | `Chang-Tong/tributo-algorithms@6f39378d4d850cfd41e9510abc313efc6d4f209f` (`packages/boosting`) | `78ecd95a05f8f33ea546fe9b9496c9d4a46eb85ed5f4f9b6a207132861cb45d7` |
+| `tributo_algorithms_boosting-0.1.0-py3-none-any.whl` | `Chang-Tong/tributo-algorithms@ee1acfb00c8632b0d259c1eaa9e3da25e00a4d8d` (`packages/boosting`) | `c9cb727d8cc91f61d4a65064e16b6fd002ecb0266e67bb19088c5d7fba09b6ab` |
 | `tributo_broker_redis-0.1.0-py3-none-any.whl` | `Chang-Tong/tributo-broker-redis@05b4ef6ca557ed3b6373ec9cfc9cc1be3648330bd` | `8db95dc7e72ddf3153cdf3b670782a4bcca5865b39a359b24a2dd737bcdd9fbe` |
 
 Rebuild the wheels with Python 3.13 whenever one of those locked commits
