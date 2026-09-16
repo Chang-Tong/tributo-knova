@@ -290,6 +290,7 @@ def test_execute_training_maps_knova_to_public_tributo_contracts(
     assert source.provider == "tributo.clickhouse"
     assert source.options["table"] == "churn_training_features"
     assert source.options["columns"] == ["active_days", "spend", "is_churn"]
+    assert source.options["partitioning"] == {"mode": "single"}
     assert "password" not in source.options
     assert "sql" not in source.options
     assert "secret_raw_sql" not in repr(ingestion_request)

@@ -457,6 +457,11 @@ def _ingestion_invocation(
         "port": port,
         "database": database,
         "columns": [*feature_names, label_name],
+        # KnoVa supplies a ClickHouse Distributed coordinator table. Let
+        # ClickHouse fan the read out to its shards, then let Ray repartition
+        # the resulting dataset for the training workers. Partition discovery
+        # is only valid for direct physical tables.
+        "partitioning": {"mode": "single"},
     }
     username = datasource.get("username")
     password = datasource.get("password")
