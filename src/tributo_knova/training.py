@@ -8,6 +8,7 @@ import posixpath
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
@@ -57,6 +58,26 @@ class _TrainingConfigurationError(ValueError):
 
 class _TrainingExecutionError(RuntimeError):
     """Credential-safe execution failure."""
+
+
+@dataclass(frozen=True)
+class _RayClassAmountSampler:
+    """Apply KnoVa's materialized class quotas with native Ray Data APIs."""
+
+    label_name: str
+    limits: tuple[tuple[object, int], ...]
+
+    def __call__(self, dataset: Any) -> Any:
+        from ray.data.expressions import col
+
+        # Materialize the canonical ClickHouse read once so each class branch
+        # reuses the same blocks instead of issuing one full table scan per class.
+        source = dataset.materialize()
+        branches = [
+            source.filter(expr=col(self.label_name) == value).limit(count)
+            for value, count in self.limits
+        ]
+        return branches[0].union(*branches[1:])
 
 
 def _invalid(message: str) -> NoReturn:
@@ -428,18 +449,199 @@ def _runtime_config(payload: Mapping[str, Any]) -> tuple[int, WorkerResources]:
     )
 
 
+def _query_scalar(value: object, clickhouse_type: str) -> object:
+    """Decode one typed ClickHouse query parameter without executing SQL."""
+    if not isinstance(value, str):
+        _invalid("data_query.query.params values must be strings")
+    normalized = clickhouse_type.strip()
+    while True:
+        wrapper = re.fullmatch(
+            r"(?is)(?:Nullable|LowCardinality)\((.+)\)", normalized
+        )
+        if wrapper is None:
+            break
+        normalized = wrapper.group(1).strip()
+    lowered = normalized.lower()
+    try:
+        if re.fullmatch(r"u?int(?:8|16|32|64|128|256)", lowered):
+            return int(value)
+        if re.fullmatch(r"float(?:32|64)", lowered) or lowered.startswith("decimal"):
+            parsed = float(value)
+            if not math.isfinite(parsed):
+                raise ValueError
+            return parsed
+        if lowered in {"bool", "boolean"}:
+            if value.lower() in {"1", "true"}:
+                return True
+            if value.lower() in {"0", "false"}:
+                return False
+            raise ValueError
+        if lowered == "string" or lowered.startswith("fixedstring"):
+            return value
+    except ValueError:
+        _invalid("data_query contains an invalid typed class value")
+    _invalid("data_query class parameter uses an unsupported ClickHouse type")
+
+
+def _projection_columns(
+    projection_sql: str,
+    *,
+    table_alias: str | None,
+) -> tuple[str, ...]:
+    identifier = r"`?[A-Za-z_][A-Za-z0-9_]*`?"
+    projected_columns: list[str] = []
+    for item in projection_sql.split(","):
+        projection = re.fullmatch(
+            rf"(?is)\s*(?:({identifier})\.)?({identifier})\s+as\s+"
+            rf"{identifier}\s*",
+            item,
+        )
+        if projection is None:
+            _invalid("data_query must contain plain column projections only")
+        projection_alias = projection.group(1)
+        if projection_alias is not None:
+            projection_alias = projection_alias.replace("`", "")
+        if table_alias is not None and projection_alias not in {None, table_alias}:
+            _invalid("data_query projection alias does not match its source table")
+        projected_columns.append(projection.group(2).replace("`", ""))
+    return tuple(projected_columns)
+
+
+def _class_amount_sampler(
+    payload: Mapping[str, Any],
+    required_columns: tuple[str, ...],
+    label_name: str,
+) -> _RayClassAmountSampler | None:
+    """Validate KnoVa's UNION ALL class sampling shape and map it to Ray Data."""
+    sampling = _mapping(payload.get("data_sampling", {}), "data_sampling")
+    raw_balance = sampling.get("class_balance")
+    if raw_balance is None:
+        return None
+    balance = _mapping(raw_balance, "data_sampling.class_balance")
+    strategy = _text(
+        balance.get("strategy", "NONE"), "data_sampling.class_balance.strategy"
+    ).upper()
+    if strategy == "NONE":
+        return None
+    if strategy not in {"UNDERSAMPLE", "CUSTOM_AMOUNT"}:
+        _invalid(f"data_sampling.class_balance.strategy={strategy} is not supported")
+    amounts = _mapping(
+        balance.get("class_amounts"),
+        "data_sampling.class_balance.class_amounts",
+    )
+    expected_amounts: dict[str, int] = {}
+    for raw_value, raw_count in amounts.items():
+        if not isinstance(raw_value, str) or not raw_value:
+            _invalid("data_sampling.class_balance.class_amounts keys must be strings")
+        expected_amounts[raw_value] = _positive_int(
+            raw_count,
+            f"data_sampling.class_balance.class_amounts[{raw_value!r}]",
+        )
+    if not expected_amounts:
+        _invalid("data_sampling.class_balance.class_amounts must not be empty")
+
+    data_query = _mapping(payload.get("data_query"), "data_query")
+    query = _mapping(data_query.get("query"), "data_query.query")
+    sql = _text(query.get("sql"), "data_query.query.sql")
+    params = _mapping(query.get("params", {}), "data_query.query.params")
+    raw_branches = re.split(r"(?is)\s+union\s+all\s+", sql.strip())
+    if len(raw_branches) != len(expected_amounts):
+        _invalid("data_query class branches do not match class_amounts")
+
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or len(tables) != 1:
+        _invalid("class-balanced data_query requires exactly one physical table")
+    table = _mapping(tables[0], "tables[0]")
+    database = _text(table.get("database_name"), "tables[0].database_name")
+    table_name = _text(table.get("table_name"), "tables[0].table_name")
+    qualified_table = f"{database}.{table_name}"
+    identifier = r"`?[A-Za-z_][A-Za-z0-9_]*`?"
+    parameter_type = r"[A-Za-z_][A-Za-z0-9_]*(?:\([^{}]*\))?"
+    branch_pattern = re.compile(
+        rf"(?is)\(\s*select\s+(.+?)\s+from\s+"
+        rf"({identifier}(?:\.{identifier})?)"
+        rf"(?:\s+(?:as\s+)?({identifier}))?\s+where\s+"
+        rf"(?:({identifier})\.)?({identifier})\s*=\s*"
+        rf"\{{({identifier}):({parameter_type})\}}\s+limit\s+(\d+)\s*\)"
+    )
+    limits: list[tuple[object, int]] = []
+    consumed_params: set[str] = set()
+    consumed_amounts: set[str] = set()
+    for raw_branch in raw_branches:
+        match = branch_pattern.fullmatch(raw_branch.strip())
+        if match is None:
+            _invalid("data_query class sampling shape is not supported")
+        (
+            projection_sql,
+            source_sql,
+            raw_alias,
+            raw_filter_alias,
+            raw_filter_column,
+            raw_parameter,
+            clickhouse_type,
+            raw_limit,
+        ) = match.groups()
+        source = source_sql.replace("`", "")
+        if source not in {table_name, qualified_table}:
+            _invalid("data_query class branches must use the declared physical table")
+        table_alias = raw_alias.replace("`", "") if raw_alias else None
+        filter_alias = (
+            raw_filter_alias.replace("`", "") if raw_filter_alias else None
+        )
+        if table_alias is not None and filter_alias not in {None, table_alias}:
+            _invalid("data_query class filter alias does not match its source table")
+        if raw_filter_column.replace("`", "") != label_name:
+            _invalid("data_query class branches must filter the target column")
+        if _projection_columns(
+            projection_sql,
+            table_alias=table_alias,
+        ) != required_columns:
+            _invalid(
+                "data_query columns do not match the requested features and target"
+            )
+
+        parameter = raw_parameter.replace("`", "")
+        if parameter in consumed_params or parameter not in params:
+            _invalid("data_query class parameters are missing or duplicated")
+        raw_value = params[parameter]
+        if not isinstance(raw_value, str) or raw_value not in expected_amounts:
+            _invalid("data_query class values do not match class_amounts")
+        limit = _positive_int(int(raw_limit), "data_query class LIMIT")
+        if limit != expected_amounts[raw_value]:
+            _invalid("data_query class LIMIT does not match class_amounts")
+        limits.append((_query_scalar(raw_value, clickhouse_type), limit))
+        consumed_params.add(parameter)
+        consumed_amounts.add(raw_value)
+
+    if consumed_params != set(params) or consumed_amounts != set(expected_amounts):
+        _invalid("data_query class parameters do not match class_amounts")
+    return _RayClassAmountSampler(label_name=label_name, limits=tuple(limits))
+
+
 def _ingestion_invocation(
     payload: Mapping[str, Any],
     feature_names: tuple[str, ...],
     label_name: str,
-) -> tuple[IngestionInputInvocation, tuple[str, str]]:
+) -> tuple[
+    IngestionInputInvocation,
+    tuple[str, str],
+    _RayClassAmountSampler | None,
+]:
     datasource = _mapping(payload.get("datasource"), "datasource")
     datasource_type = _text(datasource.get("type"), "datasource.type").upper()
     if datasource_type != "CLICKHOUSE":
         _invalid("only datasource.type=CLICKHOUSE is supported")
     properties = _mapping(datasource.get("properties", {}), "datasource.properties")
+    sampler = _class_amount_sampler(
+        payload,
+        (*feature_names, label_name),
+        label_name,
+    )
     native_table = _native_clickhouse_table(
-        payload, properties, (*feature_names, label_name)
+        payload,
+        properties,
+        (*feature_names, label_name),
+        class_query_validated=sampler is not None,
     )
     host = _text(datasource.get("host"), "datasource.host")
     database = _text(datasource.get("database_name"), "datasource.database_name")
@@ -495,6 +697,7 @@ def _ingestion_invocation(
             )
         ),
         (str(username or ""), password),
+        sampler,
     )
 
 
@@ -520,6 +723,8 @@ def _native_clickhouse_table(
     payload: Mapping[str, Any],
     properties: Mapping[str, Any],
     required_columns: tuple[str, ...],
+    *,
+    class_query_validated: bool = False,
 ) -> str:
     """Resolve KnoVa's simple DIRECT_QUERY shape to a native Ray table read."""
     configured = properties.get("native_table")
@@ -544,6 +749,9 @@ def _native_clickhouse_table(
     query = _mapping(data_query.get("query"), "data_query.query")
     sql = _text(query.get("sql"), "data_query.query.sql")
     params = _mapping(query.get("params", {}), "data_query.query.params")
+    qualified = f"{database}.{table_name}"
+    if class_query_validated:
+        return qualified
     if params:
         _invalid(
             "datasource.properties.native_table is required for parameterized queries"
@@ -557,7 +765,6 @@ def _native_clickhouse_table(
         sql,
     )
     source_name = match.group(2).replace("`", "") if match else None
-    qualified = f"{database}.{table_name}"
     if source_name not in {table_name, qualified}:
         _invalid(
             "datasource.properties.native_table is required unless data_query "
@@ -568,22 +775,7 @@ def _native_clickhouse_table(
     table_alias = match.group(3)
     if table_alias is not None:
         table_alias = table_alias.replace("`", "")
-    projected_columns: list[str] = []
-    for item in match.group(1).split(","):
-        projection = re.fullmatch(
-            rf"(?is)\s*(?:({identifier})\.)?({identifier})\s+as\s+"
-            rf"{identifier}\s*",
-            item,
-        )
-        if projection is None:
-            _invalid("data_query must contain plain column projections only")
-        projection_alias = projection.group(1)
-        if projection_alias is not None:
-            projection_alias = projection_alias.replace("`", "")
-        if table_alias is not None and projection_alias not in {None, table_alias}:
-            _invalid("data_query projection alias does not match its source table")
-        projected_columns.append(projection.group(2).replace("`", ""))
-    if tuple(projected_columns) != required_columns:
+    if _projection_columns(match.group(1), table_alias=table_alias) != required_columns:
         _invalid("data_query columns do not match the requested features and target")
     return qualified
 
@@ -596,6 +788,7 @@ def _build_execution(
     InputResolutionContext,
     int,
     tuple[str, str],
+    _RayClassAmountSampler | None,
 ]:
     payload = request.model_dump(mode="python")
     feature_names, label_name = _columns(payload)
@@ -604,7 +797,9 @@ def _build_execution(
         payload, label_name, ray_storage_path, bundle_uri
     )
     worker_count, resources = _runtime_config(payload)
-    invocation, credentials = _ingestion_invocation(payload, feature_names, label_name)
+    invocation, credentials, sampler = _ingestion_invocation(
+        payload, feature_names, label_name
+    )
     values = {_INPUT_REFERENCE: invocation}
     execution = ExecutionRequest(
         algorithm_request=AlgorithmRequest(
@@ -629,6 +824,7 @@ def _build_execution(
         InputResolutionContext(values=values),
         rounds,
         credentials,
+        sampler,
     )
 
 
@@ -1030,6 +1226,7 @@ def execute_training(
             _resolution_context,
             _rounds,
             clickhouse_credentials,
+            ray_dataset_transform,
         ) = _build_execution(request)
     except _TrainingConfigurationError:
         raise
@@ -1066,6 +1263,7 @@ def execute_training(
                 task_type=task_type,
                 num_class=(int(raw_num_class) if raw_num_class is not None else None),
                 evaluation_artifacts=evaluation_artifacts,
+                ray_dataset_transform=ray_dataset_transform,
             )
         if result.execution.status != "succeeded":
             raise _TrainingExecutionError("XGBoost training did not succeed")

@@ -685,6 +685,119 @@ def test_clickhouse_maps_knova_simple_direct_query_to_native_table(
     assert "sql" not in ingestion_request.source.options
 
 
+def test_clickhouse_maps_custom_class_amounts_to_ray_dataset_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
+    datasource = {
+        "type": "CLICKHOUSE",
+        "host": "clickhouse",
+        "database_name": "analytics",
+        "password": _SECRET,
+        "properties": {},
+    }
+    tables = [
+        {
+            "database_name": "analytics",
+            "table_name": "churn_training_features",
+        }
+    ]
+    data_query = {
+        "mode": "DIRECT_QUERY",
+        "query": {
+            "sql": (
+                "(SELECT active_days AS f0, spend AS f1, is_churn AS label "
+                "FROM analytics.churn_training_features "
+                "WHERE is_churn = {p0:UInt8} LIMIT 80)\n"
+                "UNION ALL\n"
+                "(SELECT active_days AS f0, spend AS f1, is_churn AS label "
+                "FROM analytics.churn_training_features "
+                "WHERE is_churn = {p1:UInt8} LIMIT 20)"
+            ),
+            "params": {"p0": "0", "p1": "1"},
+        },
+    }
+    data_sampling = {
+        "class_balance": {
+            "strategy": "CUSTOM_AMOUNT",
+            "class_amounts": {"0": 80, "1": 20},
+        },
+        "random_seed": 42,
+    }
+
+    training.execute_training(
+        _request(
+            datasource=datasource,
+            tables=tables,
+            data_query=data_query,
+            data_sampling=data_sampling,
+        ),
+        _Reporter(),
+    )
+
+    call = dispatcher.calls[0]
+    ingestion_request = call["ingestion_request"]
+    assert ingestion_request.source.options["table"] == "churn_training_features"
+    sampler = call["ray_dataset_transform"]
+    assert isinstance(sampler, training._RayClassAmountSampler)
+    assert sampler.label_name == "is_churn"
+    assert sampler.limits == ((0, 80), (1, 20))
+
+
+def test_clickhouse_rejects_custom_class_limit_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher = _Dispatcher()
+    monkeypatch.setattr(training, "run_xgboost_training", dispatcher)
+    datasource = {
+        "type": "CLICKHOUSE",
+        "host": "clickhouse",
+        "database_name": "analytics",
+        "password": _SECRET,
+        "properties": {},
+    }
+    tables = [
+        {
+            "database_name": "analytics",
+            "table_name": "churn_training_features",
+        }
+    ]
+    data_query = {
+        "query": {
+            "sql": (
+                "(SELECT active_days AS f0, spend AS f1, is_churn AS label "
+                "FROM analytics.churn_training_features "
+                "WHERE is_churn = {p0:UInt8} LIMIT 79)\n"
+                "UNION ALL\n"
+                "(SELECT active_days AS f0, spend AS f1, is_churn AS label "
+                "FROM analytics.churn_training_features "
+                "WHERE is_churn = {p1:UInt8} LIMIT 20)"
+            ),
+            "params": {"p0": "0", "p1": "1"},
+        }
+    }
+    data_sampling = {
+        "class_balance": {
+            "strategy": "CUSTOM_AMOUNT",
+            "class_amounts": {"0": 80, "1": 20},
+        }
+    }
+
+    with pytest.raises(ValueError, match="LIMIT does not match class_amounts"):
+        training.execute_training(
+            _request(
+                datasource=datasource,
+                tables=tables,
+                data_query=data_query,
+                data_sampling=data_sampling,
+            ),
+            _Reporter(),
+        )
+
+    assert dispatcher.calls == []
+
+
 @pytest.mark.parametrize(
     "sql",
     [
