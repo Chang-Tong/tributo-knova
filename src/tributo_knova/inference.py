@@ -20,6 +20,7 @@ from tributo.data import (
     FilterEq,
     FilterNotEq,
     IngestionRequest,
+    Limit,
     ProviderSourceConfig,
     RayDataHandle,
     ReadOptions,
@@ -54,6 +55,14 @@ _FROM = re.compile(
 )
 _WHERE = re.compile(
     r"\bWHERE\s+(.+?)(?:\bORDER\s+BY\b|\bLIMIT\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_LIMIT = re.compile(r"\bLIMIT\s+(\d+)\b", re.IGNORECASE)
+_LIMIT_TOKEN = re.compile(r"\bLIMIT\b", re.IGNORECASE)
+_DIRECT_LIMIT = re.compile(r"\bLIMIT\s+\d+\s*$", re.IGNORECASE)
+_LIMITED_SUBQUERY = re.compile(
+    r"^\s*SELECT\s+\*\s+FROM\s*\(\s*SELECT\b.+"
+    r"\bLIMIT\s+\d+\s*\)\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 _PREDICATE = re.compile(
@@ -354,7 +363,7 @@ def _input_layout(
     entity_column = _identifier(
         entity_origin.get("column_name"), "input.entity_key.origin.column_name"
     )
-    filters = _query_filters(
+    transforms = _query_transforms(
         input_value.get("query"),
         table=f"{database}.{table_name}",
         alias=alias,
@@ -364,16 +373,16 @@ def _input_layout(
         entity_column,
         tuple(features),
         tuple(result_names),
-        TransformPipeline(steps=filters),
+        TransformPipeline(steps=transforms),
     )
 
 
-def _query_filters(
+def _query_transforms(
     query_value: object,
     *,
     table: str,
     alias: str,
-) -> tuple[FilterEq | FilterNotEq | FilterComparison, ...]:
+) -> tuple[FilterEq | FilterNotEq | FilterComparison | Limit, ...]:
     if query_value is None:
         return ()
     query = _mapping(query_value, "input.query")
@@ -382,6 +391,11 @@ def _query_filters(
         return ()
     if _UNSUPPORTED_SQL.search(sql):
         _invalid("input.query supports only a single-table SELECT with scalar filters")
+    select_count = len(re.findall(r"\bSELECT\b", sql, flags=re.IGNORECASE))
+    if select_count not in {1, 2} or (
+        select_count == 2 and _LIMITED_SUBQUERY.fullmatch(sql) is None
+    ):
+        _invalid("input.query supports only a single-table SELECT with scalar filters")
     source = _FROM.search(sql)
     if source is None or source.group(1).lower() != table.lower():
         _invalid("input.query FROM must match the PRIMARY table")
@@ -389,39 +403,56 @@ def _query_filters(
     if sql_alias is not None and sql_alias.lower() != alias.lower():
         _invalid("input.query alias must match the PRIMARY table alias")
     where = _WHERE.search(sql)
-    if where is None:
-        return ()
     params = _mapping(query.get("params", {}), "input.query.params")
-    filters: list[FilterEq | FilterNotEq | FilterComparison] = []
-    for raw_condition in re.split(r"\s+AND\s+", where.group(1), flags=re.IGNORECASE):
-        condition = raw_condition.strip().strip("()")
-        match = _PREDICATE.fullmatch(condition)
-        condition_alias = None if match is None else match.group(1)
-        if match is None or (
-            condition_alias is not None and condition_alias.lower() != alias.lower()
+    transforms: list[FilterEq | FilterNotEq | FilterComparison | Limit] = []
+    if where is not None:
+        for raw_condition in re.split(
+            r"\s+AND\s+", where.group(1), flags=re.IGNORECASE
         ):
-            _invalid("input.query WHERE supports only parameterized scalar filters")
-        parameter = match.group(4)
-        if parameter not in params:
-            _invalid("input.query WHERE references a missing parameter")
-        column = match.group(2)
-        operator = match.group(3)
-        value = params[parameter]
-        if operator == "=":
-            filters.append(FilterEq(column=column, value=value))
-        elif operator in {"!=", "<>"}:
-            filters.append(FilterNotEq(column=column, value=value))
-        else:
-            filters.append(
-                FilterComparison(
-                    column=column,
-                    operator={"<": "lt", "<=": "lte", ">": "gt", ">=": "gte"}[
-                        operator
-                    ],
-                    value=_ordered_comparison_value(value),
+            condition = raw_condition.strip().strip("()")
+            match = _PREDICATE.fullmatch(condition)
+            condition_alias = None if match is None else match.group(1)
+            if match is None or (
+                condition_alias is not None and condition_alias.lower() != alias.lower()
+            ):
+                _invalid("input.query WHERE supports only parameterized scalar filters")
+            parameter = match.group(4)
+            if parameter not in params:
+                _invalid("input.query WHERE references a missing parameter")
+            column = match.group(2)
+            operator = match.group(3)
+            value = params[parameter]
+            if operator == "=":
+                transforms.append(FilterEq(column=column, value=value))
+            elif operator in {"!=", "<>"}:
+                transforms.append(FilterNotEq(column=column, value=value))
+            else:
+                transforms.append(
+                    FilterComparison(
+                        column=column,
+                        operator={
+                            "<": "lt",
+                            "<=": "lte",
+                            ">": "gt",
+                            ">=": "gte",
+                        }[operator],
+                        value=_ordered_comparison_value(value),
+                    )
                 )
-            )
-    return tuple(filters)
+    limits = _LIMIT.findall(sql)
+    if (
+        len(limits) > 1
+        or (_LIMIT_TOKEN.search(sql) is not None and not limits)
+        or (
+            select_count == 1
+            and limits
+            and _DIRECT_LIMIT.search(sql) is None
+        )
+    ):
+        _invalid("input.query LIMIT must be a single non-negative integer")
+    if limits:
+        transforms.append(Limit(count=int(limits[0])))
+    return tuple(transforms)
 
 
 def _ordered_comparison_value(value: object) -> object:
@@ -547,7 +578,15 @@ def _build_request(
     )
     columns = list(
         dict.fromkeys(
-            (entity_column, *features, *(step.column for step in transforms.steps))
+            (
+                entity_column,
+                *features,
+                *(
+                    step.column
+                    for step in transforms.steps
+                    if isinstance(step, (FilterEq, FilterNotEq, FilterComparison))
+                ),
+            )
         )
     )
     batch_size, sink_batch_size, concurrency = _execution_policy(
@@ -792,7 +831,11 @@ def _measure_input_rows(
     database = _text(options.get("database"), "input ClickHouse database")
     clauses: list[str] = []
     parameters: dict[str, object] = {}
+    row_limit: int | None = None
     for index, step in enumerate(request.input.transforms.steps):
+        if isinstance(step, Limit):
+            row_limit = step.count
+            continue
         name = f"filter_{index}"
         column = _identifier(step.column, "input query filter column")
         if isinstance(step, FilterEq):
@@ -820,7 +863,8 @@ def _measure_input_rows(
         password=credentials["TRIBUTO_CLICKHOUSE_PASSWORD"],
     )
     try:
-        return int(client.query(sql, parameters=parameters).first_row[0])
+        measured = int(client.query(sql, parameters=parameters).first_row[0])
+        return min(measured, row_limit) if row_limit is not None else measured
     except Exception as exc:
         raise _InferenceExecutionError(
             f"input row count failed ({type(exc).__name__})"

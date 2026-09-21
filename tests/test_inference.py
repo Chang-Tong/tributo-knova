@@ -307,6 +307,52 @@ def test_ordered_query_filter_repairs_numeric_string_bound() -> None:
     assert step.value == 1_000_000
 
 
+def test_generated_row_limit_is_preserved_as_ordered_ray_transform() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["input"]["query"] = {
+        "sql": (
+            "SELECT * FROM (SELECT t0.user_id, t0.spend, t0.active_days "
+            "FROM analytics.features AS t0 LIMIT 2000) sub"
+        ),
+        "params": {},
+    }
+
+    core, _sink, _credentials = inference._build_request(
+        InferenceExecutionRequest.model_validate(payload)
+    )
+
+    assert [step.type for step in core.input.transforms.steps] == ["limit"]
+    assert core.input.transforms.steps[0].count == 2000
+
+
+def test_arbitrary_nested_query_is_rejected() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["input"]["query"] = {
+        "sql": (
+            "SELECT * FROM (SELECT t0.user_id, t0.spend, t0.active_days "
+            "FROM analytics.features AS t0) sub"
+        ),
+        "params": {},
+    }
+
+    with pytest.raises(ValueError, match="single-table SELECT"):
+        inference._build_request(InferenceExecutionRequest.model_validate(payload))
+
+
+def test_limit_with_offset_is_rejected_instead_of_changing_row_identity() -> None:
+    payload = _request().model_dump(mode="python")
+    payload["input"]["query"] = {
+        "sql": (
+            "SELECT t0.user_id, t0.spend, t0.active_days "
+            "FROM analytics.features AS t0 LIMIT 2000 OFFSET 10"
+        ),
+        "params": {},
+    }
+
+    with pytest.raises(ValueError, match="LIMIT must be"):
+        inference._build_request(InferenceExecutionRequest.model_validate(payload))
+
+
 def test_execute_inference_scopes_credentials_and_reports_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
