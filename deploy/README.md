@@ -23,6 +23,28 @@ The example deliberately does not publish Redis or Ray ports. Add explicit
 loopback-only port mappings when local development tools need host access.
 ClickHouse remains a KnoVa-managed datasource supplied in each task request.
 
+Production Sentinel Redis is configured with
+`deploy/config/knova-sentinel.json`. Redis and Sentinel passwords remain in
+environment variables or mounted secret files; they must never be copied into
+the JSON file. The configured references must be available to both the
+Consumer and the external Ray Job driver. If Consumer and Ray nodes reach
+Sentinel through different addresses, keep `sentinel_nodes` and
+`driver_sentinel_nodes` distinct.
+
+Run only the Consumer against the existing Sentinel and Ray services:
+
+```bash
+cp deploy/environment.example deploy/.env
+# Fill KNOVA_REDIS_PASSWORD and the existing storage settings in deploy/.env.
+docker compose --env-file deploy/.env \
+  -f deploy/compose.sentinel.yaml up -d
+```
+
+The Compose file intentionally does not create Redis, ClickHouse, Ray, object
+storage, or any KnoVa control-plane service. The Ray cluster must receive the
+same named Redis secret independently because the password is never forwarded
+inside a Ray Job submission.
+
 For S3-compatible Bundle storage, provide the standard `AWS_*` variables to
 both `ray-head` and `consumer`. Keep them out of the JSON config and task
 payload. NAS/NFS checkpoint paths must be mounted at the same absolute path on

@@ -154,7 +154,7 @@ def _dispatch(
 
 def main() -> int:
     value, submission_id = _load_driver_input()
-    redis_client = create_redis_client(value.redis_url)
+    redis_client = create_redis_client(value.redis_connection)
     try:
         reporter = _reporter(value, redis_client, submission_id)
         try:

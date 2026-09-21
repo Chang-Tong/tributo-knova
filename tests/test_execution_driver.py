@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tributo_broker_redis.config import RedisConnectionConfig
 from tributo_broker_redis.protocol import DriverInput
 
 from tributo_knova import execution_driver
@@ -201,6 +202,44 @@ def test_main_validates_and_dispatches_the_matching_request_type(
     )
     assert isinstance(calls[0][0], expected_type)
     assert isinstance(calls[0][1], KnovaRedisEventReporter)
+    assert redis.closed is True
+
+
+def test_main_uses_sentinel_driver_connection_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = RedisConnectionConfig(
+        mode="sentinel",
+        sentinel_nodes=("redis-sentinel:26379",),
+        sentinel_master="mymaster",
+        database=3,
+        password_ref="env:KNOVA_REDIS_PASSWORD",
+    )
+    legacy = _driver_input()
+    value = DriverInput.model_validate(
+        {
+            **legacy.model_dump(exclude={"redis_url", "redis_transport"}),
+            "redis_transport": sentinel.model_dump(),
+        }
+    )
+    redis = _Redis()
+    connections: list[object] = []
+
+    monkeypatch.setattr(
+        execution_driver,
+        "_load_driver_input",
+        lambda: (value, "submission-1"),
+    )
+    monkeypatch.setattr(
+        execution_driver,
+        "create_redis_client",
+        lambda connection: (connections.append(connection), redis)[1],
+    )
+    monkeypatch.setattr(execution_driver, "_initialize_ray", lambda: None)
+    monkeypatch.setattr(execution_driver, "_execute_training", lambda *_args: None)
+
+    assert execution_driver.main() == 0
+    assert connections == [sentinel]
     assert redis.closed is True
 
 

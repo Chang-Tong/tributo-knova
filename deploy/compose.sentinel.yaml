@@ -1,0 +1,23 @@
+name: tributo-knova-consumer
+
+services:
+  tributo-knova-consumer:
+    image: ${TRIBUTO_KNOVA_IMAGE:-tributo-knova:prod-arm64-sentinel}
+    pull_policy: never
+    init: true
+    command:
+      - tributo-knova
+      - consume
+      - --config
+      - /etc/tributo-knova/config.json
+    environment:
+      KNOVA_REDIS_PASSWORD: ${KNOVA_REDIS_PASSWORD:?KNOVA_REDIS_PASSWORD is required}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_EC2_METADATA_DISABLED: ${AWS_EC2_METADATA_DISABLED:-true}
+    volumes:
+      - ./config/knova-sentinel.json:/etc/tributo-knova/config.json:ro
+    restart: unless-stopped
+    stop_grace_period: 30s
