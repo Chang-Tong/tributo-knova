@@ -1,0 +1,13 @@
+{
+  "context": "YOUR_CONTEXT",
+  "namespace": "lakehouse-system",
+  "name": "tributo-knova-consumer",
+  "image": "YOUR_REGISTRY/lakehouse/knova-tributo-devbox:v2.7",
+  "architecture": "arm64",
+  "secret": "tributo-knova-env",
+  "config": "config.json",
+  "probe": "probe.json",
+  "timeout_seconds": 360,
+  "image_pull_policy": "IfNotPresent",
+  "output": "consumer-release"
+}

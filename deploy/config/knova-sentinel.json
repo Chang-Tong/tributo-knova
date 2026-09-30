@@ -17,7 +17,8 @@
     "database": 3,
     "password_ref": "env:KNOVA_REDIS_PASSWORD",
     "block_ms": 1000,
-    "claim_idle_ms": 60000
+    "claim_idle_ms": 60000,
+    "max_driver_input_bytes": 262144
   },
   "channels": {
     "training": {

@@ -9,6 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from tributo_broker_redis.config import OperationType
 from tributo_broker_redis.protocol import ProtocolFailure
 
+from tributo_knova.validation import (
+    ProtocolValidationError,
+    validate_inference_payload,
+    validate_training_payload,
+)
+
 PROTOCOL_VERSION = "2.0"
 
 
@@ -30,7 +36,7 @@ class _Request(BaseModel):
 
     protocol_version: str
     tenant_id: str = Field(min_length=1, max_length=256)
-    extensions: dict[str, Any] = Field(default_factory=dict)
+    extensions: Any = Field(default_factory=dict)
 
     @field_validator("protocol_version")
     @classmethod
@@ -104,12 +110,10 @@ def parse_request(
         value = json.loads(raw_payload)
     except json.JSONDecodeError as exc:
         raise KnovaProtocolFailure(
-            "INVALID_JSON", "payload is not valid JSON"
+            "INVALID_PAYLOAD", "payload is not valid JSON"
         ) from exc
     if not isinstance(value, dict):
-        raise KnovaProtocolFailure(
-            "INVALID_REQUEST", "payload root must be an object"
-        )
+        raise KnovaProtocolFailure("INVALID_PAYLOAD", "payload root must be an object")
     if "protocol_version" not in value:
         raise KnovaProtocolFailure(
             "UNSUPPORTED_PROTOCOL_VERSION", "protocol_version is required"
@@ -128,18 +132,23 @@ def parse_request(
             for error in exc.errors(include_input=False)
             if tuple(error["loc"]) == ("protocol_version",)
         }
-        code = (
-            "UNSUPPORTED_PROTOCOL_VERSION"
-            if version_errors
-            else "INVALID_REQUEST"
-        )
+        code = "UNSUPPORTED_PROTOCOL_VERSION" if version_errors else "INVALID_PAYLOAD"
         raise KnovaProtocolFailure(code, "request schema validation failed") from exc
 
     if request.execution_id != outer_operation_id:
         raise KnovaProtocolFailure(
-            "IDENTITY_MISMATCH",
+            "INVALID_PAYLOAD",
             "outer operation identity does not match payload identity",
         )
+    try:
+        validator = (
+            validate_training_payload
+            if expected_operation_type == "training"
+            else validate_inference_payload
+        )
+        validator(request.model_dump(mode="python"))
+    except ProtocolValidationError as exc:
+        raise KnovaProtocolFailure("INVALID_PAYLOAD", str(exc)) from None
     return request
 
 

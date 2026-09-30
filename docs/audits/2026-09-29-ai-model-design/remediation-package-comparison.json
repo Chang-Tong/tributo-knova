@@ -1,0 +1,20 @@
+{
+  "tributo_knova": {
+    "files": 9,
+    "mismatches": []
+  },
+  "tributo_broker_redis": {
+    "files": 13,
+    "mismatches": []
+  },
+  "tributo_broker_redis_wheel": {
+    "files": 13,
+    "mismatches": [],
+    "sha256": "8da5ef811ed7a4de0716ecd315e6ffafb9549803be226601c767280a2bc53178"
+  },
+  "tributo_algorithms_boosting_wheel": {
+    "files": 11,
+    "mismatches": [],
+    "sha256": "c8bbed6fd0c9f828b37de498113f578f93c4ccb2ba5811ff80ee8f4424d4e922"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "context": "YOUR_CONTEXT",
+  "namespace": "lakehouse-system",
+  "name": "tributo-knova-v25",
+  "image": "YOUR_REGISTRY/lakehouse/knova-tributo-devbox:v2.5",
+  "architecture": "arm64",
+  "config": "config.json",
+  "secret": "tributo-knova-env",
+  "workers": 1,
+  "cpus": 4,
+  "memory": "8Gi",
+  "s3_bucket": "YOUR_BUCKET",
+  "output": "release-v25"
+}

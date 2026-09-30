@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import posixpath
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from traceback import format_list, walk_tb
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
@@ -22,7 +24,19 @@ from tributo.algorithms import (
 )
 from tributo.algorithms.api import AlgorithmRunResult
 from tributo.algorithms.spi import InputExecutionContext, InputResolutionContext
-from tributo.data import IngestionRequest, ProviderSourceConfig
+from tributo.data import (
+    ColumnRename,
+    FilterComparison,
+    FilterEq,
+    FilterNotEq,
+    IngestionRequest,
+    Limit,
+    ProviderSourceConfig,
+    RenameColumns,
+    SelectColumns,
+    TransformPipeline,
+)
+from tributo.exceptions import DataQueryError, DataSourceError
 from tributo.exporting import BundleRef, load_bundle
 from tributo.integrations.algorithm_inputs import (
     INGESTION_RESOLVER_ID,
@@ -31,6 +45,7 @@ from tributo.integrations.algorithm_inputs import (
 from tributo_algorithms_boosting import run_xgboost_training
 
 from tributo_knova.protocol import TrainingExecutionRequest
+from tributo_knova.validation import ProtocolValidationError, validate_training_payload
 
 _CLICKHOUSE_BINDING_ID = "ray_clickhouse.ray.clickhouse"
 _INPUT_REFERENCE = "knova.training.input"
@@ -50,14 +65,111 @@ _CONTROL_HYPER_PARAMETERS = frozenset(
 _SENSITIVE_PROPERTY_TOKENS = frozenset(
     {"access", "credential", "key", "password", "secret", "token"}
 )
+logger = logging.getLogger(__name__)
+_KNOWN_DATA_FAILURES = {
+    "training dataset is empty": "Training input is empty after filtering",
+    "Couldn't create non-empty splits with the given proportions.": (
+        "Training input is too small for the configured train/validation/test split"
+    ),
+}
+
+
+def _log_training_failure(message: str, job_id: str, error: Exception) -> None:
+    """Keep frame locations without logging credentials from exception details."""
+    # Do not pass exc_info: handlers may render exception messages, causes,
+    # notes or source lines containing credentials. Frame locations and the
+    # exception type still identify the failing call in Ray Job logs.
+    frames = [
+        (frame.f_code.co_filename, lineno, frame.f_code.co_name, "")
+        for frame, lineno in walk_tb(error.__traceback__)
+    ]
+    logger.error(
+        "%s: operation_id=%s error_type=%s\n"
+        "Traceback (most recent call last):\n%s"
+        "%s: exception details omitted",
+        message,
+        job_id,
+        type(error).__name__,
+        "".join(format_list(frames)),
+        type(error).__name__,
+    )
 
 
 class _TrainingConfigurationError(ValueError):
     """Credential-safe request mapping failure."""
 
+    code = "INVALID_PAYLOAD"
+    phase = "QUEUED"
+
 
 class _TrainingExecutionError(RuntimeError):
     """Credential-safe execution failure."""
+
+    code = "TRAINING_FAILED"
+    phase = "TRAINING"
+
+
+def _classify_training_failure(
+    error: Exception, reporter: Any, *, publishing: bool = False
+) -> tuple[str, str]:
+    """Classify by execution context without inspecting sensitive exception text."""
+    phase = getattr(reporter, "_current_phase", "LOADING_DATA")
+    phase = {
+        "PREPARING": "LOADING_DATA",
+        "EXECUTING": "TRAINING",
+        "MATERIALIZING": "EVALUATING",
+        "PUBLISHING": "EVALUATING",
+    }.get(phase, phase)
+    causes: list[Exception] = []
+    cause: BaseException | None = error
+    while isinstance(cause, Exception) and all(cause is not item for item in causes):
+        causes.append(cause)
+        cause = cause.__cause__
+    frames = tuple(frame for item in causes for frame in walk_tb(item.__traceback__))
+    exporting = publishing or any(
+        (
+            frame.f_globals.get("__name__") == "tributo_algorithms_boosting.training"
+            and frame.f_code.co_name == "_export_bundle"
+        )
+        or (
+            frame.f_globals.get("__name__") == __name__
+            and frame.f_code.co_name in {"_artifact_manifest", "_artifact_storage"}
+        )
+        for frame, _ in frames
+    )
+    if exporting:
+        return "MODEL_EXPORT_FAILED", "EVALUATING"
+    if any(
+        isinstance(item, (DataSourceError, DataQueryError)) for item in causes
+    ) or any(
+        frame.f_globals.get("__name__")
+        in {
+            "tributo.data.ingestion",
+            "ray_clickhouse.datasource",
+            "ray_clickhouse._discovery",
+            "ray_clickhouse._planning",
+        }
+        for frame, _ in frames
+    ):
+        return "DATA_QUERY_FAILED", "LOADING_DATA"
+    if phase in {"LOADING_DATA", "DATA_SPLITTING"}:
+        code = (
+            "DATA_SOURCE_UNREACHABLE"
+            if isinstance(error, (ConnectionError, TimeoutError))
+            else "DATA_QUERY_FAILED"
+        )
+        return code, phase
+    return {
+        "FEATURE_ENGINEERING": "FEATURE_ENGINEERING_FAILED",
+        "EVALUATING": "EVALUATION_FAILED",
+    }.get(phase, "TRAINING_FAILED"), phase
+
+
+def _execution_error(message: str, code: str, phase: str) -> _TrainingExecutionError:
+    error = _TrainingExecutionError(message)
+    error.code = code
+    error.phase = phase
+    return error
 
 
 @dataclass(frozen=True)
@@ -78,6 +190,168 @@ class _RayClassAmountSampler:
             for value, count in self.limits
         ]
         return branches[0].union(*branches[1:])
+
+
+class _TrainingDataError(_TrainingExecutionError):
+    code = "DATA_QUERY_FAILED"
+    phase = "LOADING_DATA"
+
+
+def _first_entity_row(batch: Any) -> Any:
+    return batch.iloc[:1]
+
+
+@dataclass
+class _RayInputValidation:
+    """Validate loaded result columns and entity grain using native Ray Data."""
+
+    payload: Mapping[str, Any]
+    transform: Callable[[Any], Any] | None
+    reporter: Any = None
+
+    def _warning(self, message: str) -> None:
+        logger.warning(message)
+        if self.reporter is not None:
+            self.reporter.publish(
+                "LOG", {"level": "warning", "message": message}, phase="LOADING_DATA"
+            )
+
+    def __call__(self, dataset: Any) -> Any:
+        if callable(getattr(self.reporter, "check_control", None)):
+            self.reporter.check_control()
+        expected = set(_column_mapping(self.payload).values())
+        missing = expected.difference(dataset.schema().names)
+        if missing:
+            raise _TrainingDataError(
+                "Training query result is missing declared result_column: "
+                + ", ".join(sorted(missing))
+            )
+        entity = self.payload["data_query"].get("entity_key")
+        if entity is not None:
+            source = dataset.materialize()
+            # Native groupby works across partitions; per-batch duplicates would
+            # miss duplicate entities arriving in different ClickHouse blocks.
+            distinct = (
+                source.groupby(entity["result_column"])
+                .map_groups(_first_entity_row, batch_format="pandas")
+                .materialize()
+            )
+            if distinct.count() != source.count():
+                self._warning(
+                    "Duplicate entity keys in training query; "
+                    "keeping one row per entity"
+                )
+            dataset = distinct
+        if self.transform is not None:
+            # Class quotas are applied before label encoding by _RayLabelEncoder.
+            dataset = self.transform(dataset)
+        balance = self.payload.get("data_sampling", {}).get("class_balance")
+        if (
+            balance
+            and balance.get("strategy") in {"UNDERSAMPLE", "CUSTOM_AMOUNT"}
+            and balance.get("class_amounts")
+        ):
+            target = self.payload["target"]
+            mapping = target.get("label_mapping") or {}
+            from ray.data.expressions import col
+
+            dataset = dataset.materialize()
+            for raw_label, expected_count in balance["class_amounts"].items():
+                label = mapping.get(raw_label, raw_label)
+                if raw_label not in mapping:
+                    label = _query_scalar(raw_label, target["origin"]["column_type"])
+                actual = dataset.filter(
+                    expr=col(target["result_column"]) == label
+                ).count()
+                if abs(actual - expected_count) / expected_count > 0.05:
+                    self._warning(
+                        "Training class sample count differs from class_amounts "
+                        "by more than 5%"
+                    )
+        names, label = _columns(self.payload)
+        return dataset.select_columns([*names, label])
+
+
+def _encode_target_batch(
+    batch: Any, *, label_name: str, label_mapping: Mapping[str, int], num_class: int
+) -> Any:
+    """Encode raw string labels; preserve already encoded numeric targets."""
+    import numpy as np
+    import pandas as pd
+
+    target = batch[label_name]
+    if target.isna().any():
+        _invalid("target contains null classification labels")
+    numeric_values = pd.api.types.infer_dtype(target.to_numpy(), skipna=False) in {
+        "integer",
+        "floating",
+        "mixed-integer-float",
+        "decimal",
+        "boolean",
+    }
+    if pd.api.types.is_numeric_dtype(target.dtype) or numeric_values:
+        encoded = pd.to_numeric(target, errors="coerce")
+    else:
+        encoded = target.map(label_mapping)
+    values = encoded.to_numpy(dtype=float)
+    if (
+        not np.isfinite(values).all()
+        or (values != np.floor(values)).any()
+        or (values < 0).any()
+        or (values >= num_class).any()
+    ):
+        _invalid("target contains unknown or invalid classification labels")
+    result = batch.copy()
+    result[label_name] = values.astype(np.int64)
+    return result
+
+
+@dataclass(frozen=True)
+class _RayLabelEncoder:
+    """Use native Ray batch mapping after any raw-label class sampling."""
+
+    label_name: str
+    label_mapping: Mapping[str, int]
+    num_class: int
+    sampler: _RayClassAmountSampler | None = None
+
+    def __call__(self, dataset: Any) -> Any:
+        if self.sampler is not None:
+            dataset = self.sampler(dataset)
+        return dataset.map_batches(
+            _encode_target_batch,
+            batch_format="pandas",
+            fn_kwargs={
+                "label_name": self.label_name,
+                "label_mapping": self.label_mapping,
+                "num_class": self.num_class,
+            },
+        )
+
+
+def _target_encoder(
+    target: Mapping[str, Any],
+    label_name: str,
+    model: Mapping[str, Any],
+    sampler: _RayClassAmountSampler | None,
+) -> Callable[[Any], Any] | None:
+    if target.get("task_type", "").upper() == "REGRESSION":
+        return sampler
+    num_class = model.get("num_class", 2)
+    mapping = target.get("label_mapping")
+    if mapping is None:
+        mapping = {}
+    mapping = _mapping(mapping, "target.label_mapping")
+    if mapping and (
+        any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in mapping.values()
+        )
+        or len(mapping) != num_class
+        or set(mapping.values()) != set(range(num_class))
+    ):
+        _invalid("target.label_mapping must uniquely encode every class from zero")
+    return _RayLabelEncoder(label_name, dict(mapping), num_class, sampler)
 
 
 def _invalid(message: str) -> NoReturn:
@@ -297,30 +571,26 @@ def _storage_config(payload: Mapping[str, Any]) -> tuple[str, str]:
     _invalid("storage_context.type must be nfs, nas, shared_fs, or s3")
 
 
+def _column_mapping(payload: Mapping[str, Any]) -> dict[str, str]:
+    columns = [*payload["features"], payload["target"]]
+    entity = payload["data_query"].get("entity_key")
+    if entity is not None:
+        columns.append(entity)
+    mapping: dict[str, str] = {}
+    for column in columns:
+        source, result = column["origin"]["column_name"], column["result_column"]
+        if source in mapping and mapping[source] != result:
+            _invalid("multiple result aliases for one source column are unsupported")
+        if result in mapping.values() and mapping.get(source) != result:
+            _invalid("result_column must identify one source column")
+        mapping[source] = result
+    return mapping
+
+
 def _columns(payload: Mapping[str, Any]) -> tuple[tuple[str, ...], str]:
-    raw_features = payload.get("features")
-    if not isinstance(raw_features, list) or not raw_features:
-        _invalid("features must be a non-empty array")
-
-    feature_names: list[str] = []
-    for index, raw_feature in enumerate(raw_features):
-        feature = _mapping(raw_feature, f"features[{index}]")
-        origin = _mapping(feature.get("origin"), f"features[{index}].origin")
-        feature_names.append(
-            _text(
-                origin.get("column_name"),
-                f"features[{index}].origin.column_name",
-            )
-        )
-
-    target = _mapping(payload.get("target"), "target")
-    target_origin = _mapping(target.get("origin"), "target.origin")
-    label_name = _text(target_origin.get("column_name"), "target.origin.column_name")
-    if len(set(feature_names)) != len(feature_names):
-        _invalid("feature origin column names must be unique")
-    if label_name in feature_names:
-        _invalid("target origin column must not also be a feature column")
-    return tuple(feature_names), label_name
+    return tuple(feature["result_column"] for feature in payload["features"]), payload[
+        "target"
+    ]["result_column"]
 
 
 def _objective(
@@ -366,7 +636,7 @@ def _algorithm_config(
     algorithm_key = _text(
         algorithm.get("algorithm_key"), "algorithm.algorithm_key"
     ).lower()
-    if algorithm_key != "xgboost":
+    if algorithm_key not in {"xgboost", "xgboost_reg"}:
         _invalid("only algorithm_key=xgboost is supported")
 
     hyper_parameters = _mapping(
@@ -398,11 +668,34 @@ def _algorithm_config(
         "num_rounds": rounds,
         **_data_split_config(payload),
     }
-    early_stopping = hyper_parameters.get("early_stopping_rounds")
+    if resource_limits.get("max_training_time_seconds") is not None:
+        training["max_training_time_seconds"] = resource_limits[
+            "max_training_time_seconds"
+        ]
+    if str(target.get("task_type", "")).upper() == "BINARY_CLASSIFICATION":
+        positive = target.get("positive_label_value")
+        label_mapping = target.get("label_mapping") or {}
+        if positive is None:
+            positive_code = 1
+        elif isinstance(positive, (str, int)) and not isinstance(positive, bool):
+            if label_mapping:
+                positive_code = label_mapping.get(str(positive))
+            elif str(positive) in {"0", "1"}:
+                positive_code = int(positive)
+            else:
+                positive_code = None
+        else:
+            positive_code = None
+        if isinstance(positive_code, bool) or positive_code not in (0, 1):
+            _invalid("target.positive_label_value must identify a binary class")
+        training["positive_label"] = positive_code
+    early_stopping = resource_limits.get(
+        "early_stopping_patience", hyper_parameters.get("early_stopping_rounds")
+    )
     if early_stopping is not None:
         training["early_stopping_rounds"] = _positive_int(
             early_stopping,
-            "algorithm.hyper_params.early_stopping_rounds",
+            "resource_limits.early_stopping_patience",
         )
         if training["validation_ratio"] <= 0:
             _invalid("early stopping requires a non-empty validation split")
@@ -420,29 +713,30 @@ def _algorithm_config(
 
 
 def _runtime_config(payload: Mapping[str, Any]) -> tuple[int, WorkerResources]:
-    extensions = _mapping(payload.get("extensions", {}), "extensions")
-    tributo = _mapping(extensions.get("tributo", {}), "extensions.tributo")
-    training_runtime = _mapping(
-        tributo.get("training_runtime", {}),
-        "extensions.tributo.training_runtime",
-    )
-    ray = _mapping(
-        training_runtime.get("ray", {}),
-        "extensions.tributo.training_runtime.ray",
-    )
-    num_workers = _positive_int(
-        ray.get("num_workers", 2),
-        "extensions.tributo.training_runtime.ray.num_workers",
-    )
-    if num_workers < 2:
-        _invalid("XGBoost distributed training requires at least two workers")
-    cpus_per_worker = _positive_number(
-        ray.get("cpus_per_worker", 1),
-        "extensions.tributo.training_runtime.ray.cpus_per_worker",
-    )
+    # Extensions are opaque by protocol. Invalid or future content cannot reject
+    # an otherwise valid request; consume only recognizable runtime hints.
+    ray: Mapping[str, Any] = payload
+    for key in ("extensions", "tributo", "training_runtime", "ray"):
+        value = ray.get(key, {})
+        ray = value if isinstance(value, Mapping) else {}
+    num_workers = ray.get("num_workers", 2)
+    if (
+        not isinstance(num_workers, int)
+        or isinstance(num_workers, bool)
+        or num_workers < 2
+    ):
+        num_workers = 2
+    cpus_per_worker = ray.get("cpus_per_worker", 1)
+    if (
+        isinstance(cpus_per_worker, bool)
+        or not isinstance(cpus_per_worker, (int, float))
+        or not math.isfinite(cpus_per_worker)
+        or cpus_per_worker <= 0
+    ):
+        cpus_per_worker = 1
     use_gpu = ray.get("use_gpu", False)
     if not isinstance(use_gpu, bool):
-        _invalid("extensions.tributo.training_runtime.ray.use_gpu must be a boolean")
+        use_gpu = False
     return num_workers, WorkerResources(
         num_cpus=cpus_per_worker,
         num_gpus=1.0 if use_gpu else 0.0,
@@ -455,9 +749,7 @@ def _query_scalar(value: object, clickhouse_type: str) -> object:
         _invalid("data_query.query.params values must be strings")
     normalized = clickhouse_type.strip()
     while True:
-        wrapper = re.fullmatch(
-            r"(?is)(?:Nullable|LowCardinality)\((.+)\)", normalized
-        )
+        wrapper = re.fullmatch(r"(?is)(?:Nullable|LowCardinality)\((.+)\)", normalized)
         if wrapper is None:
             break
         normalized = wrapper.group(1).strip()
@@ -487,13 +779,13 @@ def _projection_columns(
     projection_sql: str,
     *,
     table_alias: str | None,
-) -> tuple[str, ...]:
+) -> dict[str, str]:
     identifier = r"`?[A-Za-z_][A-Za-z0-9_]*`?"
-    projected_columns: list[str] = []
+    projected_columns: dict[str, str] = {}
     for item in projection_sql.split(","):
         projection = re.fullmatch(
             rf"(?is)\s*(?:({identifier})\.)?({identifier})\s+as\s+"
-            rf"{identifier}\s*",
+            rf"({identifier})\s*",
             item,
         )
         if projection is None:
@@ -503,8 +795,14 @@ def _projection_columns(
             projection_alias = projection_alias.replace("`", "")
         if table_alias is not None and projection_alias not in {None, table_alias}:
             _invalid("data_query projection alias does not match its source table")
-        projected_columns.append(projection.group(2).replace("`", ""))
-    return tuple(projected_columns)
+        source, result = (
+            projection.group(2).replace("`", ""),
+            projection.group(3).replace("`", ""),
+        )
+        if source in projected_columns or result in projected_columns.values():
+            _invalid("data_query projection columns must be unique")
+        projected_columns[source] = result
+    return projected_columns
 
 
 def _class_amount_sampler(
@@ -524,7 +822,7 @@ def _class_amount_sampler(
     if strategy == "NONE":
         return None
     if strategy not in {"UNDERSAMPLE", "CUSTOM_AMOUNT"}:
-        _invalid(f"data_sampling.class_balance.strategy={strategy} is not supported")
+        _invalid("data_sampling.class_balance.strategy is not supported")
     amounts = _mapping(
         balance.get("class_amounts"),
         "data_sampling.class_balance.class_amounts",
@@ -535,7 +833,7 @@ def _class_amount_sampler(
             _invalid("data_sampling.class_balance.class_amounts keys must be strings")
         expected_amounts[raw_value] = _positive_int(
             raw_count,
-            f"data_sampling.class_balance.class_amounts[{raw_value!r}]",
+            "data_sampling.class_balance.class_amounts value",
         )
     if not expected_amounts:
         _invalid("data_sampling.class_balance.class_amounts must not be empty")
@@ -585,17 +883,18 @@ def _class_amount_sampler(
         if source not in {table_name, qualified_table}:
             _invalid("data_query class branches must use the declared physical table")
         table_alias = raw_alias.replace("`", "") if raw_alias else None
-        filter_alias = (
-            raw_filter_alias.replace("`", "") if raw_filter_alias else None
-        )
+        filter_alias = raw_filter_alias.replace("`", "") if raw_filter_alias else None
         if table_alias is not None and filter_alias not in {None, table_alias}:
             _invalid("data_query class filter alias does not match its source table")
-        if raw_filter_column.replace("`", "") != label_name:
+        if (
+            raw_filter_column.replace("`", "")
+            != payload["target"]["origin"]["column_name"]
+        ):
             _invalid("data_query class branches must filter the target column")
         if _projection_columns(
             projection_sql,
             table_alias=table_alias,
-        ) != required_columns:
+        ) != _column_mapping(payload):
             _invalid(
                 "data_query columns do not match the requested features and target"
             )
@@ -632,15 +931,13 @@ def _ingestion_invocation(
     if datasource_type != "CLICKHOUSE":
         _invalid("only datasource.type=CLICKHOUSE is supported")
     properties = _mapping(datasource.get("properties", {}), "datasource.properties")
-    sampler = _class_amount_sampler(
-        payload,
-        (*feature_names, label_name),
-        label_name,
-    )
-    native_table = _native_clickhouse_table(
+    column_mapping = _column_mapping(payload)
+    source_columns = tuple(column_mapping)
+    sampler = _class_amount_sampler(payload, source_columns, label_name)
+    native_table, transforms = _native_clickhouse_read(
         payload,
         properties,
-        (*feature_names, label_name),
+        source_columns,
         class_query_validated=sampler is not None,
     )
     host = _text(datasource.get("host"), "datasource.host")
@@ -653,12 +950,19 @@ def _ingestion_invocation(
         _invalid("datasource.host is invalid")
     uri_host = host if ":" not in host or host.startswith("[") else f"[{host}]"
 
+    columns = list(source_columns)
+    for step in transforms.steps:
+        if (
+            isinstance(step, (FilterEq, FilterNotEq, FilterComparison))
+            and step.column not in columns
+        ):
+            columns.append(step.column)
     options: dict[str, Any] = {
         "table": table_name,
         "host": host,
         "port": port,
         "database": database,
-        "columns": [*feature_names, label_name],
+        "columns": columns,
         # KnoVa supplies a ClickHouse Distributed coordinator table. Let
         # ClickHouse fan the read out to its shards, then let Ray repartition
         # the resulting dataset for the training workers. Partition discovery
@@ -669,8 +973,8 @@ def _ingestion_invocation(
     password = datasource.get("password")
     if username is not None:
         options["user"] = _text(username, "datasource.username")
-    if password is None:
-        reference = datasource.get("credential_ref")
+    reference = datasource.get("credential_ref")
+    if reference is not None or password is None:
         if isinstance(reference, str) and reference.startswith("env://"):
             password_env = reference.removeprefix("env://")
             if _ENV_NAME.fullmatch(password_env) is None:
@@ -683,6 +987,16 @@ def _ingestion_invocation(
     if not isinstance(password, str):
         _invalid("datasource.password must be a string or env credential reference")
 
+    renames = tuple(
+        ColumnRename(source=source, target=result)
+        for source, result in column_mapping.items()
+        if source != result
+    )
+    if renames:
+        transforms = TransformPipeline(
+            steps=(*transforms.steps, RenameColumns(renames=renames))
+        )
+
     source = ProviderSourceConfig(
         provider="tributo.clickhouse",
         uri=f"clickhouse://{uri_host}:{port}/{database}",
@@ -694,6 +1008,7 @@ def _ingestion_invocation(
                 source=source,
                 engine="ray",
                 binding_id=_CLICKHOUSE_BINDING_ID,
+                transforms=transforms,
             )
         ),
         (str(username or ""), password),
@@ -719,20 +1034,18 @@ def _clickhouse_environment(credentials: tuple[str, str]) -> Iterator[None]:
                 os.environ[name] = value
 
 
-def _native_clickhouse_table(
+def _native_clickhouse_read(
     payload: Mapping[str, Any],
     properties: Mapping[str, Any],
     required_columns: tuple[str, ...],
     *,
     class_query_validated: bool = False,
-) -> str:
-    """Resolve KnoVa's simple DIRECT_QUERY shape to a native Ray table read."""
+) -> tuple[str, TransformPipeline]:
+    """Map a restricted single-table query to typed ingestion transforms."""
     configured = properties.get("native_table")
-    if configured is not None:
-        return _text(configured, "datasource.properties.native_table")
-
     tables = payload.get("tables")
     data_query = payload.get("data_query")
+    identifier = r"`?[A-Za-z_][A-Za-z0-9_]*`?"
     if (
         not isinstance(tables, list)
         or len(tables) != 1
@@ -750,18 +1063,24 @@ def _native_clickhouse_table(
     sql = _text(query.get("sql"), "data_query.query.sql")
     params = _mapping(query.get("params", {}), "data_query.query.params")
     qualified = f"{database}.{table_name}"
-    if class_query_validated:
-        return qualified
-    if params:
-        _invalid(
-            "datasource.properties.native_table is required for parameterized queries"
+    if (
+        configured is not None
+        and _native_table_name(
+            _text(configured, "datasource.properties.native_table"), database
         )
+        != table_name
+    ):
+        _invalid(
+            "datasource.properties.native_table must match data_query source table"
+        )
+    if class_query_validated:
+        return qualified, TransformPipeline()
 
-    identifier = r"`?[A-Za-z_][A-Za-z0-9_]*`?"
     match = re.fullmatch(
         rf"(?is)\s*select\s+(.+?)\s+from\s+"
         rf"({identifier}(?:\.{identifier})?)"
-        rf"(?:\s+(?:as\s+)?({identifier}))?\s*;?\s*",
+        rf"(?:\s+(?:as\s+)?((?!(?:WHERE|LIMIT)\b){identifier}))?"
+        rf"(?:\s+where\s+(.+?))?(?:\s+limit\s+(\d+))?\s*;?\s*",
         sql,
     )
     source_name = match.group(2).replace("`", "") if match else None
@@ -775,9 +1094,69 @@ def _native_clickhouse_table(
     table_alias = match.group(3)
     if table_alias is not None:
         table_alias = table_alias.replace("`", "")
-    if _projection_columns(match.group(1), table_alias=table_alias) != required_columns:
+    declared_alias = table.get("table_alias")
+    if (
+        table_alias is not None
+        and declared_alias is not None
+        and table_alias != declared_alias
+    ):
+        _invalid("data_query alias does not match its source table")
+    if _projection_columns(match.group(1), table_alias=table_alias) != _column_mapping(
+        payload
+    ):
         _invalid("data_query columns do not match the requested features and target")
-    return qualified
+
+    steps: list[FilterEq | FilterNotEq | FilterComparison | Limit | SelectColumns] = []
+    consumed_params: set[str] = set()
+    if match.group(4) is not None:
+        for condition in re.split(r"\s+AND\s+", match.group(4), flags=re.IGNORECASE):
+            predicate = re.fullmatch(
+                rf"\s*(\(*)\s*(?:({identifier})\.)?({identifier})"
+                rf"\s*(<=|>=|!=|<>|=|<|>)\s*"
+                rf"\{{([A-Za-z_][A-Za-z0-9_]*):([A-Za-z0-9_(), ]+)\}}"
+                rf"\s*(\)*)\s*",
+                condition,
+            )
+            if predicate is None or len(predicate.group(1)) != len(predicate.group(7)):
+                _invalid(
+                    "data_query WHERE supports only AND-combined "
+                    "parameterized scalar filters"
+                )
+            filter_alias = predicate.group(2)
+            if (
+                filter_alias is not None
+                and filter_alias.replace("`", "") != table_alias
+            ):
+                _invalid("data_query filter alias does not match its source table")
+            column, operator, parameter, parameter_type = predicate.group(3, 4, 5, 6)
+            if parameter not in params:
+                _invalid("data_query WHERE references a missing parameter")
+            value = _query_scalar(params[parameter], parameter_type)
+            column = column.replace("`", "")
+            if operator == "=":
+                steps.append(FilterEq(column=column, value=value))
+            elif operator in {"!=", "<>"}:
+                steps.append(FilterNotEq(column=column, value=value))
+            else:
+                steps.append(
+                    FilterComparison(
+                        column=column,
+                        operator={"<": "lt", "<=": "lte", ">": "gt", ">=": "gte"}[
+                            operator
+                        ],
+                        value=value,
+                    )
+                )
+            consumed_params.add(parameter)
+    if consumed_params != set(params):
+        _invalid("data_query contains unused parameters")
+    if match.group(5) is not None:
+        steps.append(Limit(count=int(match.group(5))))
+    if steps:
+        # Filter-only columns must be available to Ray, but must not become
+        # accidental model features. Preserve filter -> limit -> projection order.
+        steps.append(SelectColumns(columns=required_columns))
+    return qualified, TransformPipeline(steps=tuple(steps))
 
 
 def _build_execution(
@@ -788,9 +1167,18 @@ def _build_execution(
     InputResolutionContext,
     int,
     tuple[str, str],
-    _RayClassAmountSampler | None,
+    Callable[[Any], Any] | None,
 ]:
+    logger.info("Building training execution plan: operation_id=%s", request.job_id)
     payload = request.model_dump(mode="python")
+    try:
+        validate_training_payload(payload)
+    except ProtocolValidationError as exc:
+        raise _TrainingConfigurationError(str(exc)) from None
+    query = _mapping(payload.get("data_query") or {}, "data_query")
+    if query.get("mode", "DIRECT_QUERY") != "DIRECT_QUERY":
+        _invalid("only data_query.mode=DIRECT_QUERY is supported by this runtime")
+    _validate_feature_treatments(payload)
     feature_names, label_name = _columns(payload)
     ray_storage_path, bundle_uri = _storage_config(payload)
     algorithm_config, rounds = _algorithm_config(
@@ -799,6 +1187,24 @@ def _build_execution(
     worker_count, resources = _runtime_config(payload)
     invocation, credentials, sampler = _ingestion_invocation(
         payload, feature_names, label_name
+    )
+    transform = _target_encoder(
+        _mapping(payload.get("target"), "target"),
+        label_name,
+        algorithm_config["model"],
+        sampler,
+    )
+    transform = _RayInputValidation(payload, transform)
+    sampling = _mapping(payload.get("data_sampling", {}), "data_sampling")
+    logger.info(
+        "Training execution plan ready: operation_id=%s features=%d label=%s "
+        "workers=%d rounds=%d sample_limit=%s",
+        request.job_id,
+        len(feature_names),
+        label_name,
+        worker_count,
+        rounds,
+        sampling.get("sample_limit", "<unspecified>"),
     )
     values = {_INPUT_REFERENCE: invocation}
     execution = ExecutionRequest(
@@ -824,8 +1230,33 @@ def _build_execution(
         InputResolutionContext(values=values),
         rounds,
         credentials,
-        sampler,
+        transform,
     )
+
+
+def _validate_feature_treatments(payload: Mapping[str, Any]) -> None:
+    """Reject requested preprocessing that this passthrough runtime cannot apply."""
+    defaults = _mapping(payload.get("feature_engineering") or {}, "feature_engineering")
+    allowed = {
+        "missing_value_strategy": {"AUTO"},
+        "outlier_strategy": {"AUTO", "NONE"},
+        "scaling_method": {"AUTO", "NONE"},
+        "encoding_method": {"AUTO", "NONE"},
+    }
+    for feature in payload.get("features", []):
+        treatment = _mapping(feature.get("treatment") or {}, "features.treatment")
+        if treatment.get("treatment_type") not in (None, "AUTO", "NUMERIC"):
+            _invalid(
+                "features.treatment.treatment_type is not supported by this runtime"
+            )
+        for field, supported in allowed.items():
+            value = treatment.get(field)
+            if value is None:
+                value = defaults.get("default_" + field)
+            if value is not None and (
+                not isinstance(value, str) or value not in supported
+            ):
+                _invalid(f"features.treatment.{field} is not supported by this runtime")
 
 
 def _safe_storage_properties(value: object) -> dict[str, str]:
@@ -1069,11 +1500,22 @@ def _evaluation_metrics(result: AlgorithmRunResult) -> list[dict[str, Any]]:
 def _evaluation_details(
     result: AlgorithmRunResult,
     task_type: str,
+    target: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_details = _internal_metrics(result).get("evaluation_details", {})
     if not isinstance(raw_details, Mapping):
         raw_details = {}
     details = dict(raw_details)
+    confusion = details.get("confusion_matrix")
+    label_mapping = (target or {}).get("label_mapping")
+    if isinstance(confusion, Mapping) and isinstance(label_mapping, Mapping):
+        labels = confusion.get("labels")
+        if isinstance(labels, (list, tuple)):
+            inverse = {str(code): label for label, code in label_mapping.items()}
+            details["confusion_matrix"] = {
+                **confusion,
+                "labels": [inverse.get(str(label), str(label)) for label in labels],
+            }
     if task_type in {"BINARY_CLASSIFICATION", "MULTICLASS_CLASSIFICATION"}:
         details.setdefault("confusion_matrix", None)
         details.setdefault("roc_curve", None)
@@ -1167,10 +1609,8 @@ def _completed_payload(
     feature_ids: dict[str, str] = {}
     for index, raw_feature in enumerate(features):
         feature = _mapping(raw_feature, f"features[{index}]")
-        origin = _mapping(feature.get("origin"), f"features[{index}].origin")
         model_feature_name = _text(
-            origin.get("column_name"),
-            f"features[{index}].origin.column_name",
+            feature.get("result_column"), f"features[{index}].result_column"
         )
         feature_id = str(feature.get("feature_id") or f"f{index + 1:03d}")
         feature_ids[model_feature_name] = feature_id
@@ -1199,7 +1639,7 @@ def _completed_payload(
                 "eval_type": task_type,
                 "sample_rows": rows["test"],
                 "metrics": metrics,
-                "details": _evaluation_details(result, task_type),
+                "details": _evaluation_details(result, task_type, request.target),
             },
             "feature_analysis": _feature_analysis(
                 payload,
@@ -1228,13 +1668,52 @@ def execute_training(
             clickhouse_credentials,
             ray_dataset_transform,
         ) = _build_execution(request)
-    except _TrainingConfigurationError:
-        raise
-    except Exception:
+    except _TrainingConfigurationError as exc:
+        _log_training_failure(
+            "Training request mapping failed",
+            request.job_id,
+            exc,
+        )
+        raise exc from None
+    except Exception as exc:
+        _log_training_failure(
+            "Unexpected training plan failure",
+            request.job_id,
+            exc,
+        )
         raise _TrainingConfigurationError("training request mapping failed") from None
 
+    publishing = False
     try:
+        logger.info(
+            "Training execution preparing: operation_id=%s features=%d workers=%d",
+            request.job_id,
+            len(execution.algorithm_request.input_binding.feature_names),
+            execution.worker_count,
+        )
+        if callable(getattr(reporter, "configure_timeout", None)):
+            reporter.configure_timeout(
+                execution.algorithm_request.algorithm_config["training"].get(
+                    "max_training_time_seconds"
+                )
+            )
+        if callable(getattr(reporter, "check_control", None)):
+            reporter.check_control()
         reporter.phase("PREPARING")
+        if isinstance(ray_dataset_transform, _RayInputValidation):
+            ray_dataset_transform.reporter = reporter
+        if getattr(request, "tuning", {}).get("mode") == "AUTO":
+            reporter.publish(
+                "LOG",
+                {
+                    "level": "warning",
+                    "message": (
+                        "AUTO tuning is not implemented; running one MANUAL "
+                        "training with baseline hyperparameters"
+                    ),
+                },
+                phase="LOADING_DATA",
+            )
         binding = execution.algorithm_request.input_binding
         invocation = input_context.values.get(_INPUT_REFERENCE)
         if not isinstance(invocation, IngestionInputInvocation):
@@ -1251,6 +1730,14 @@ def execute_training(
             _text(model_config.get("objective"), "algorithm objective"),
         )
         with _clickhouse_environment(clickhouse_credentials):
+            logger.info(
+                "Starting distributed XGBoost training: operation_id=%s "
+                "features=%d workers=%d task_type=%s",
+                request.job_id,
+                len(binding.feature_names),
+                execution.worker_count,
+                task_type,
+            )
             result = run_xgboost_training(
                 ingestion_request=invocation.request,
                 feature_names=binding.feature_names,
@@ -1265,19 +1752,60 @@ def execute_training(
                 evaluation_artifacts=evaluation_artifacts,
                 ray_dataset_transform=ray_dataset_transform,
             )
+        logger.info(
+            "Distributed XGBoost training returned: operation_id=%s status=%s",
+            request.job_id,
+            result.execution.status,
+        )
         if result.execution.status != "succeeded":
             raise _TrainingExecutionError("XGBoost training did not succeed")
+        publishing = True
         reporter.publish(
             "COMPLETED",
             _completed_payload(request, result),
             phase="COMPLETED",
         )
         return result
-    except _TrainingExecutionError:
-        raise
+    except _TrainingExecutionError as exc:
+        if type(exc) is _TrainingExecutionError:
+            exc.code, exc.phase = _classify_training_failure(
+                exc, reporter, publishing=publishing
+            )
+        _log_training_failure(
+            "Training execution failed",
+            request.job_id,
+            exc,
+        )
+        raise exc from None
     except Exception as exc:
-        raise _TrainingExecutionError(
-            f"XGBoost training execution failed ({type(exc).__name__})"
+        if getattr(exc, "code", None) in {
+            "EXECUTION_TIMEOUT",
+            "TRAINING_TIMEOUT",
+            "CANCELLED",
+        }:
+            raise
+        _log_training_failure(
+            "Unexpected XGBoost training failure",
+            request.job_id,
+            exc,
+        )
+        if (
+            type(exc) is ValueError
+            and len(exc.args) == 1
+            and type(exc.args[0]) is str
+            and exc.args[0] in _KNOWN_DATA_FAILURES
+        ):
+            code = (
+                "EMPTY_DATASET"
+                if exc.args[0] == "training dataset is empty"
+                else "DATA_QUERY_FAILED"
+            )
+            raise _execution_error(
+                _KNOWN_DATA_FAILURES[exc.args[0]], code, "LOADING_DATA"
+            ) from None
+        code, phase = _classify_training_failure(exc, reporter, publishing=publishing)
+        raise _execution_error(
+            f"XGBoost training execution failed ({type(exc).__name__})", code, phase
         ) from None
 
 

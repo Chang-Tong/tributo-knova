@@ -4,12 +4,38 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import signal
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
 from tributo_knova.broker import KnovaBrokerPlugin
+
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _configure_logging(level: str | None) -> None:
+    """Configure human-readable consumer logs without exposing config values."""
+    selected = (
+        level
+        or os.environ.get("KNOVA_LOG_LEVEL")
+        or os.environ.get("TRIBUTO_LOG_LEVEL")
+        or "INFO"
+    ).upper()
+    if selected not in _LOG_LEVELS:
+        raise ValueError(
+            "log level must be one of: " + ", ".join(_LOG_LEVELS)
+        )
+    logging.basicConfig(
+        level=getattr(logging, selected),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # basicConfig is a no-op when an embedding process already installed a
+    # handler. Still raise the root threshold so provider INFO logs are visible.
+    logging.getLogger().setLevel(getattr(logging, selected))
 
 
 def _read_config(path: Path) -> dict[str, Any]:
@@ -32,6 +58,13 @@ def _parser() -> argparse.ArgumentParser:
     consume = commands.add_parser("consume", help="run the provider consume loop")
     consume.add_argument("--config", type=Path, required=True)
     consume.add_argument("--once", action="store_true")
+    consume.add_argument(
+        "--log-level",
+        choices=_LOG_LEVELS,
+        default=None,
+        type=str.upper,
+        help="consumer log level (default: KNOVA_LOG_LEVEL or INFO)",
+    )
     return parser
 
 
@@ -63,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         print("KnoVa broker configuration is valid")
         return 0
 
+    _configure_logging(args.log_level)
     runtime = plugin.create_runtime(raw)
 
     def _stop(_signum: int, _frame: object) -> None:

@@ -1,0 +1,20 @@
+{
+  "tributo_knova": {
+    "source_files": 8,
+    "image_files": 8,
+    "differences": []
+  },
+  "tributo_broker_redis": {
+    "source_files": 13,
+    "image_files": 13,
+    "differences": []
+  },
+  "tributo_broker_redis_wheel": {
+    "wheel_sha256": "a1d77b6d86a731f29dc4c9c197a2dc204b06d62db67dc92f467c8335b485352b",
+    "differences": []
+  },
+  "tributo_algorithms_boosting_wheel": {
+    "wheel_sha256": "4e6addbeca1f912e514fd73442c43e7d1551fbd2d334e0f53629a28f12f2da27",
+    "differences": []
+  }
+}

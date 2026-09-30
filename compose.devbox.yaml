@@ -10,6 +10,10 @@ x-tributo-knova-environment: &tributo-knova-environment
   AWS_ENDPOINT_URL: http://rustfs:9000
   AWS_REGION: ${RUSTFS_REGION:-cn-east-1}
   AWS_EC2_METADATA_DISABLED: "true"
+  # The ClickHouse write Datasink runs in Ray workers, not in the consumer.
+  # Keep this credential at cluster scope so it is never included in a Ray Job
+  # runtime environment or its dashboard metadata.
+  KNOVA_OUTPUT_CLICKHOUSE_PASSWORD: ${KNOVA_INFERENCE_RESULT_CLICKHOUSE_PASSWORD:-knova&dev}
 
 services:
   tributo-knova-ray:

@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: lakehouse-system
+resources:
+  - consumer.yaml
+configMapGenerator:
+  - name: tributo-knova-config
+    files:
+      - config.json
+images:
+  - name: knova-tributo-devbox
+    newName: knova-tributo-devbox
+    newTag: v2.7

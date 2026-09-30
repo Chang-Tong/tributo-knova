@@ -1,0 +1,25 @@
+# Keep dependencies from the validated ARM64 base; update provider code only.
+ARG BASE_IMAGE=knova-tributo-devbox:v2.4
+FROM ${BASE_IMAGE}
+USER root
+
+COPY src/tributo_knova /opt/tributo-knova/lib/python3.13/site-packages/tributo_knova
+COPY vendor/wheels/tributo_broker_redis-0.1.0-py3-none-any.whl /tmp/broker-wheel/
+COPY vendor/wheels/tributo_algorithms_boosting-0.1.0-py3-none-any.whl /tmp/broker-wheel/
+COPY deploy/verify_image.py /opt/tributo-runtime/verify_image.py
+RUN set -eu; \
+    /opt/tributo-knova/bin/python -m ensurepip --upgrade; \
+    /opt/tributo-knova/bin/python -m pip install --no-deps --no-index \
+        --force-reinstall /tmp/broker-wheel/*.whl; \
+    site_packages="$(/opt/tributo-knova/bin/python -c \
+        'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    for package in tributo_knova tributo_broker_redis tributo_algorithms_boosting; do \
+        rm -rf "/opt/tributo-runtime/extensions/$package"; \
+        cp -a "$site_packages/$package" "/opt/tributo-runtime/extensions/$package"; \
+    done; \
+    rm -rf /tmp/broker-wheel; \
+    /opt/tributo-knova/bin/python /opt/tributo-runtime/verify_image.py
+
+ARG RELEASE_VERSION=2.5
+LABEL org.opencontainers.image.version="${RELEASE_VERSION}"
+USER tributo-knova

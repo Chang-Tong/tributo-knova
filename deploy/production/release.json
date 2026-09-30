@@ -1,0 +1,77 @@
+{
+  "image": "knova-tributo-devbox:v2.5",
+  "image_id": "sha256:9f9c8077ebe4f5971380d43b363b7c1494f04a3f39861ec0a0cf2e8974569101",
+  "platform": "linux/arm64",
+  "archive": "knova-tributo-devbox-arm64-v2.5.tar.zst",
+  "archive_bytes": 536462571,
+  "archive_sha256": "667a3eb8e76dcef7232c9bb5c923d16503dbb8677284c8c26bb71d31300c2e44",
+  "archive_manifest_verified": true,
+  "zstd_integrity_verified": true,
+  "workload_cases_passed": 17,
+  "workload_cases_failed": 0,
+  "sentinel_cases_passed": 8,
+  "sentinel_cases_failed": 0,
+  "knova_unit_passed": 200,
+  "knova_packaged_dependencies_passed": 200,
+  "unit_suites_are_same_cases": true,
+  "generic_broker": {
+    "tests_passed": 86,
+    "tests_failed": 9,
+    "scope": "tributo-generic-v1 training entrypoint is incompatible with the pinned Core wheel; KnoVa uses its own preparer and driver",
+    "limitation": "tributo.training.xgboost_trainer is absent"
+  },
+  "frontend": {
+    "model_name": "本地全面验收-0924",
+    "model_id": "mdl-eqaamo8fmsbukwbs",
+    "training_version_id": "ver-cdi5oyw3rgfi02ck",
+    "training_rows": 834,
+    "training_features": 6,
+    "training_status": "COMPLETED",
+    "inference_task_id": "itask-gdgw7iu4xz6c7j",
+    "inference_executions": 6,
+    "thresholds": [
+      0,
+      0.5,
+      1
+    ],
+    "positive_predictions": [
+      834,
+      4,
+      0
+    ],
+    "same_entity_probabilities": true,
+    "shap_rows": 83,
+    "empty_input_completed": true,
+    "cancelled_execution_verified": true,
+    "result_preview_verified": false,
+    "whole_product_passed": false,
+    "known_issues_report": "COMPREHENSIVE-V25.md"
+  },
+  "preflight": {
+    "final_image": true,
+    "head_and_worker": true,
+    "three_package_source_consistency": true,
+    "redis": true,
+    "s3": true,
+    "shared_path": true,
+    "probe_cleanup": true
+  },
+  "kubernetes": {
+    "v25_apply_verified": false,
+    "v25_production_cluster_verified": false,
+    "deployment_and_preflight_unit_tests_passed": 39,
+    "historical_k8s_acceptance_version": "v2.4",
+    "note": "Historical v2.4 Kubernetes results are not v2.5 acceptance."
+  },
+  "hotfix_context": {
+    "archive": "knova-v2.5-hotfix-context.tar.gz",
+    "bytes": 109636,
+    "sha256": "6e882d60feb5e5c2b964850fd504d8787887c03ad0ec03e560f864990ae98741",
+    "requires_base_image_id": "sha256:50100dc136124bfe22ced8a8790aa58075deb2bb6dcd7bd007d14426ee502d95",
+    "offline_build_verified": true,
+    "python_source_files_equal_to_delivery": 349,
+    "rebuilt_image_id": "sha256:5f3b902ab8cf11beb4d8107d3c98020e3ce4b0087d662a985660191e02fa6783",
+    "full_business_suite_targets_delivery_image": true
+  },
+  "report": "COMPREHENSIVE-V25.md"
+}
