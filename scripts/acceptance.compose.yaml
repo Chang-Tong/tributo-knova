@@ -1,0 +1,68 @@
+services:
+  redis:
+    image: redis:8-bookworm
+    command: [redis-server, --requirepass, local-repro-only]
+    networks:
+      default:
+        aliases: [repro-redis]
+  clickhouse:
+    image: artifact.nc.rdcloud.4c.hq.cmcc:80/knovapriv-libs/library/clickhouse:26.3.17
+    environment:
+      CLICKHOUSE_USER: knova
+      CLICKHOUSE_PASSWORD: local-test-only
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: '1'
+  rustfs:
+    image: artifact.nc.rdcloud.4c.hq.cmcc:80/knovapriv-libs/rustfs/rustfs:1.0.0-beta.8-glibc
+    environment:
+      RUSTFS_ACCESS_KEY: localtestkey
+      RUSTFS_SECRET_KEY: local-test-secret
+      RUSTFS_VOLUMES: /data
+  ray-head:
+    image: ${ACCEPT_IMAGE:-knova-tributo-devbox:v2.5}
+    entrypoint: ray
+    command: [start, --head, '--dashboard-host=0.0.0.0', '--runtime-env-agent-port=52366', '--num-cpus=0', '--object-store-memory=268435456', --disable-usage-stats, --block]
+    shm_size: 1gb
+    mem_limit: 6g
+    environment: &ray_environment
+      KNOVA_REDIS_PASSWORD: local-repro-only
+      KNOVA_REDIS_SENTINEL_PASSWORD: local-sentinel-only
+      KNOVA_OUTPUT_CLICKHOUSE_PASSWORD: local-test-only
+      AWS_ACCESS_KEY_ID: localtestkey
+      AWS_SECRET_ACCESS_KEY: local-test-secret
+      AWS_ENDPOINT_URL: http://rustfs:9000
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: 'true'
+    volumes:
+      - ${ACCEPT_ARTIFACTS}/shared:/accept-shared
+    networks:
+      default:
+        aliases: [repro-ray]
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8265/api/version", timeout=3)']
+      interval: 3s
+      timeout: 5s
+      retries: 40
+  ray-worker:
+    image: ${ACCEPT_IMAGE:-knova-tributo-devbox:v2.5}
+    entrypoint: ray
+    command: [start, '--address=repro-ray:6379', '--num-cpus=4', '--object-store-memory=536870912', --disable-usage-stats, --block]
+    shm_size: 2gb
+    mem_limit: 6g
+    environment: *ray_environment
+    volumes:
+      - ${ACCEPT_ARTIFACTS}/shared:/accept-shared
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+  workloads:
+    image: ${ACCEPT_IMAGE:-knova-tributo-devbox:v2.5}
+    profiles: [test]
+    entrypoint: [python, /scripts/acceptance_workloads.py]
+    environment:
+      KNOVA_REDIS_PASSWORD: local-repro-only
+    volumes:
+      - .:/scripts:ro
+      - ${ACCEPT_ARTIFACTS}:/artifacts
+      - ${ACCEPT_ARTIFACTS}/shared:/accept-shared
