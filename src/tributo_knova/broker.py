@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from tributo.integrations.broker import BROKER_API_VERSION, BrokerPlugin, BrokerRuntime
+from tributo_broker_redis.cancellation import ActiveSubmission
 from tributo_broker_redis.config import OperationType, normalize_config
 from tributo_broker_redis.operations import MappingFailure, PreparedOperation
 from tributo_broker_redis.plugin import RedisBrokerPlugin
@@ -95,6 +96,19 @@ def _timeout_seconds(
     return float(value)
 
 
+def _matches_knova_terminal_event(
+    event: Mapping[str, Any], submission: ActiveSubmission
+) -> bool:
+    """Match KnoVa v2's immutable public identity without a Ray submission ID."""
+    identity_field = submission.channel.outer_identity_field
+    return (
+        event.get("protocol_version") == "2.0"
+        and event.get("submission_id") is None
+        and identity_field in {"job_id", "execution_id"}
+        and event.get(identity_field) == submission.operation_id
+    )
+
+
 class KnovaBrokerPlugin(BrokerPlugin):
     """KnoVa v2 configuration of the existing Redis Streams provider."""
 
@@ -126,6 +140,7 @@ class KnovaBrokerPlugin(BrokerPlugin):
             operation_preparer=prepare_broker_operation,
             driver_entrypoint=DRIVER_ENTRYPOINT,
             reporter_factory=KnovaRedisEventReporter,
+            terminal_event_matcher=_matches_knova_terminal_event,
         )
 
 

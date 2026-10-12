@@ -19,6 +19,7 @@ from tributo_broker_redis.runtime import RedisBrokerRuntime
 
 from tributo_knova.broker import (
     DRIVER_ENTRYPOINT,
+    _matches_knova_terminal_event,
     _redis_broker_config,
     parse_broker_request,
     prepare_broker_operation,
@@ -124,10 +125,36 @@ def test_watcher_recognizes_knova_v2_terminal_without_submission_id(
         max_stream_length=100,
         status_getter=unexpected_status,
         reporter_factory=KnovaRedisEventReporter,
+        terminal_event_matcher=_matches_knova_terminal_event,
     )
     watcher.check_once()
     assert active.snapshot() == ()
     assert len(redis.events) == 1
+
+
+def test_knova_terminal_matcher_rejects_other_protocols_and_identities(
+    tmp_path: Path,
+) -> None:
+    config = _broker_config(tmp_path)
+    item = ActiveSubmission(
+        operation_id="job-terminal",
+        operation_type="training",
+        execution_profile="distributed",
+        run_id="job-terminal",
+        channel=config.channels.training,
+        submission=RayJobSubmission(
+            run_id="job-terminal",
+            attempt_id="attempt-1",
+            submission_id="submission-terminal",
+        ),
+    )
+    event = {"protocol_version": "2.0", "job_id": "job-terminal"}
+    assert _matches_knova_terminal_event(event, item)
+    assert not _matches_knova_terminal_event({**event, "job_id": "other"}, item)
+    assert not _matches_knova_terminal_event({**event, "protocol_version": "1.0"}, item)
+    assert not _matches_knova_terminal_event(
+        {**event, "submission_id": "another-submission"}, item
+    )
 
 
 def _broker_config(core_root: Path) -> RedisBrokerConfig:
