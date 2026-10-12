@@ -6,25 +6,26 @@
     "url": "redis://redis:6379/3",
     "driver_url": "redis://redis:6379/3",
     "block_ms": 1000,
-    "claim_idle_ms": 60000
+    "claim_idle_ms": 60000,
+    "max_driver_input_bytes": 262144
   },
   "channels": {
     "training": {
       "task_stream_key": "knova:aimodel:training:distributed:tasks",
       "event_stream_prefix": "knova:aimodel:training:distributed:events",
       "cancel_key_prefix": "knova:aimodel:training:distributed:cancel",
-      "consumer_group": "knova-trainers",
+      "consumer_group": "knova-trainers-tributo-knova-devbox",
       "consumer_name": "tributo-knova-training",
-      "group_start_id": "0-0",
+      "group_start_id": "$",
       "outer_identity_field": "job_id"
     },
     "batch_inference": {
       "task_stream_key": "knova:aimodel:inference:distributed:tasks",
       "event_stream_prefix": "knova:aimodel:inference:distributed:events",
       "cancel_key_prefix": "knova:aimodel:inference:distributed:cancel",
-      "consumer_group": "knova-backend-inference",
+      "consumer_group": "knova-inference-tributo-knova-devbox",
       "consumer_name": "tributo-knova-inference",
-      "group_start_id": "0-0",
+      "group_start_id": "$",
       "outer_identity_field": "execution_id"
     }
   },

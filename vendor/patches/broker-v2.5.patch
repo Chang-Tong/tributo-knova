@@ -1,0 +1,1135 @@
+diff --git a/src/tributo_broker_redis/cancellation.py b/src/tributo_broker_redis/cancellation.py
+index 4a02c6b..ffdccc9 100644
+--- a/src/tributo_broker_redis/cancellation.py
++++ b/src/tributo_broker_redis/cancellation.py
+@@ -80,6 +80,16 @@ def terminal_event_published(
+             and submission_id == item.submission.submission_id
+         ):
+             return True
++        # KnoVa v2 uses an immutable job_id/execution_id and has no submission_id.
++        # Keep the generic protocol's strict attempt matching above intact.
++        if (
++            event_type in _TERMINAL_EVENT_TYPES
++            and submission_id is None
++            and event.get("protocol_version") == "2.0"
++            and item.channel.outer_identity_field in {"job_id", "execution_id"}
++            and event.get(item.channel.outer_identity_field) == item.operation_id
++        ):
++            return True
+     return False
+ 
+ 
+@@ -130,6 +140,11 @@ class CancelWatcher:
+         for item in self._active.snapshot():
+             try:
+                 if self._terminal_event_published(item):
++                    logger.info(
++                        "Terminal event observed: operation_id=%s submission_id=%s",
++                        item.operation_id,
++                        item.submission.submission_id,
++                    )
+                     self._active.remove(item.operation_id)
+                     self._stop_requested.discard(item.operation_id)
+                     continue
+@@ -164,8 +179,10 @@ class CancelWatcher:
+                     self._stop_requested.add(item.operation_id)
+             except Exception:
+                 logger.warning(
+-                    "Cancellation watcher check failed: operation_id=%s",
++                    "Ray lifecycle watcher check failed; will retry: "
++                    "operation_id=%s submission_id=%s",
+                     item.operation_id,
++                    item.submission.submission_id,
+                     exc_info=True,
+                 )
+ 
+@@ -182,6 +199,15 @@ class CancelWatcher:
+ 
+     def _report_failed(self, item: ActiveSubmission, code: str) -> None:
+         reporter = self._reporter(item)
++        logger.warning(
++            "Ray job ended without a terminal event; publishing fallback: "
++            "operation_id=%s submission_id=%s ray_job_id=%s code=%s stream=%s",
++            item.operation_id,
++            item.submission.submission_id,
++            item.submission.ray_job_id or "<unknown>",
++            code,
++            reporter.stream_key,
++        )
+         reporter.publish(
+             "FAILED",
+             {
+@@ -191,6 +217,14 @@ class CancelWatcher:
+             },
+             phase="FAILED",
+         )
++        logger.info(
++            "Fallback FAILED event published: operation_id=%s submission_id=%s "
++            "code=%s stream=%s",
++            item.operation_id,
++            item.submission.submission_id,
++            code,
++            reporter.stream_key,
++        )
+ 
+     def _reporter(self, item: ActiveSubmission) -> RedisEventReporter:
+         reporter = self._reporter_factory(
+diff --git a/src/tributo_broker_redis/cli.py b/src/tributo_broker_redis/cli.py
+index 8f78622..5c56d70 100644
+--- a/src/tributo_broker_redis/cli.py
++++ b/src/tributo_broker_redis/cli.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import logging
++import os
+ import signal
+ from pathlib import Path
+ from typing import Any
+@@ -12,6 +14,26 @@ from tributo_broker_redis.config import normalize_config
+ from tributo_broker_redis.plugin import RedisBrokerPlugin
+ from tributo_broker_redis.runtime import RedisBrokerRuntime
+ 
++_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
++
++
++def _configure_logging(level: str | None) -> None:
++    selected = (
++        level
++        or os.environ.get("TRIBUTO_LOG_LEVEL")
++        or "INFO"
++    ).upper()
++    if selected not in _LOG_LEVELS:
++        raise ValueError(
++            "log level must be one of: " + ", ".join(_LOG_LEVELS)
++        )
++    logging.basicConfig(
++        level=getattr(logging, selected),
++        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
++        datefmt="%Y-%m-%d %H:%M:%S",
++    )
++    logging.getLogger().setLevel(getattr(logging, selected))
++
+ 
+ def _read_config(path: Path) -> dict[str, Any]:
+     value = json.loads(path.read_text(encoding="utf-8"))
+@@ -29,6 +51,13 @@ def _parser() -> argparse.ArgumentParser:
+     consume = commands.add_parser("consume", help="run the provider consume loop")
+     consume.add_argument("--config", type=Path, required=True)
+     consume.add_argument("--once", action="store_true")
++    consume.add_argument(
++        "--log-level",
++        choices=_LOG_LEVELS,
++        default=None,
++        type=str.upper,
++        help="consumer log level (default: TRIBUTO_LOG_LEVEL or INFO)",
++    )
+     return parser
+ 
+ 
+@@ -43,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
+         print("Redis broker configuration is valid")
+         return 0
+ 
++    _configure_logging(args.log_level)
+     runtime = RedisBrokerRuntime(normalize_config(raw))
+ 
+     def _stop(_signum: int, _frame: object) -> None:
+diff --git a/src/tributo_broker_redis/config.py b/src/tributo_broker_redis/config.py
+index cc7f4e2..53d6d16 100644
+--- a/src/tributo_broker_redis/config.py
++++ b/src/tributo_broker_redis/config.py
+@@ -145,6 +145,7 @@ class RedisTransportConfig(RedisConnectionConfig):
+     claim_idle_ms: int = Field(default=60000, ge=0)
+     claim_count: int = Field(default=10, ge=1, le=1000)
+     max_payload_bytes: int = Field(default=1024 * 1024, ge=1)
++    max_driver_input_bytes: int = Field(default=256 * 1024, ge=1)
+     max_event_bytes: int = Field(default=1024 * 1024, ge=1)
+     max_stream_length: int = Field(default=1000, ge=1)
+ 
+diff --git a/src/tributo_broker_redis/consumer.py b/src/tributo_broker_redis/consumer.py
+index 7b6c5e5..6fdba38 100644
+--- a/src/tributo_broker_redis/consumer.py
++++ b/src/tributo_broker_redis/consumer.py
+@@ -52,6 +52,13 @@ class RedisTaskConsumer(TaskConsumer):
+             code, _, _ = str(exc).partition(" ")
+             if code.upper() != "BUSYGROUP":
+                 raise
++        logger.info(
++            "Redis consumer ready: operation_type=%s stream=%s group=%s consumer=%s",
++            self.operation_type,
++            self.channel.task_stream_key,
++            self.channel.consumer_group,
++            self.channel.consumer_name,
++        )
+ 
+     def _message(self, delivery_id: Any, fields: dict[Any, Any]) -> Message:
+         decoded = {_decode(key): _decode(value) for key, value in fields.items()}
+@@ -68,7 +75,7 @@ class RedisTaskConsumer(TaskConsumer):
+         payload_error = ""
+         if len(raw.encode("utf-8")) > self.transport.max_payload_bytes:
+             payload_error = "payload exceeds configured size limit"
+-        return Message(
++        message = Message(
+             payload={"raw": raw},
+             delivery_token=_decode(delivery_id),
+             metadata={
+@@ -80,6 +87,18 @@ class RedisTaskConsumer(TaskConsumer):
+                 "payload_error": payload_error,
+             },
+         )
++        logger.debug(
++            "Redis delivery received: operation_type=%s stream=%s delivery=%s "
++            "operation_id=%s payload_bytes=%d envelope_error=%s payload_error=%s",
++            self.operation_type,
++            self.channel.task_stream_key,
++            message.delivery_token,
++            outer_operation_id or "<missing>",
++            len(raw.encode("utf-8")),
++            bool(envelope_error),
++            bool(payload_error),
++        )
++        return message
+ 
+     def poll(self, timeout_ms: int = 5000) -> Message | None:
+         if self._pending_messages:
+@@ -113,7 +132,10 @@ class RedisTaskConsumer(TaskConsumer):
+ 
+     def retry(self, message: Message, error: BrokerError | None = None) -> None:
+         logger.warning(
+-            "Leaving Redis delivery pending: stream=%s delivery=%s code=%s",
++            "Leaving Redis delivery pending: operation_type=%s operation_id=%s "
++            "stream=%s delivery=%s code=%s",
++            self.operation_type,
++            message.metadata.get("outer_operation_id") or "<missing>",
+             self.channel.task_stream_key,
+             message.delivery_token,
+             error.code if error else "UNKNOWN",
+@@ -121,8 +143,10 @@ class RedisTaskConsumer(TaskConsumer):
+ 
+     def reject(self, message: Message, error: BrokerError | None = None) -> None:
+         logger.warning(
+-            "No DLQ configured; acknowledging rejected delivery: stream=%s "
+-            "delivery=%s code=%s",
++            "No DLQ configured; acknowledging rejected delivery: "
++            "operation_type=%s operation_id=%s stream=%s delivery=%s code=%s",
++            self.operation_type,
++            message.metadata.get("outer_operation_id") or "<missing>",
+             self.channel.task_stream_key,
+             message.delivery_token,
+             error.code if error else "UNKNOWN",
+@@ -130,7 +154,9 @@ class RedisTaskConsumer(TaskConsumer):
+         self.ack(message)
+ 
+     def recover_pending(self) -> int:
+-        """Best-effort XAUTOCLAIM; v0.1 makes no recovery guarantee."""
++        """Claim one pending page after the previously claimed page is consumed."""
++        if self._pending_messages:
++            return 0
+         xautoclaim = getattr(self._redis, "xautoclaim", None)
+         if not callable(xautoclaim):
+             return 0
+@@ -151,6 +177,14 @@ class RedisTaskConsumer(TaskConsumer):
+         self._pending_messages.extend(
+             self._message(delivery_id, fields) for delivery_id, fields in claimed
+         )
++        if claimed:
++            logger.info(
++                "Recovered pending Redis deliveries: operation_type=%s "
++                "stream=%s count=%d",
++                self.operation_type,
++                self.channel.task_stream_key,
++                len(claimed),
++            )
+         return len(claimed)
+ 
+     def close(self) -> None:
+diff --git a/src/tributo_broker_redis/execution_driver.py b/src/tributo_broker_redis/execution_driver.py
+index a043e8f..b9f7703 100644
+--- a/src/tributo_broker_redis/execution_driver.py
++++ b/src/tributo_broker_redis/execution_driver.py
+@@ -9,6 +9,7 @@ import re
+ import sys
+ from pathlib import Path
+ 
++from tributo_broker_redis.driver_transport import read_driver_input
+ from tributo_broker_redis.protocol import DriverInput
+ from tributo_broker_redis.redis_client import create_redis_client
+ from tributo_broker_redis.reporter import RedisEventReporter
+@@ -27,9 +28,7 @@ class _TerminalEventPublicationError(Exception):
+ 
+ 
+ def _load_driver_input() -> tuple[DriverInput, str]:
+-    raw = os.environ.get(_DRIVER_ENV)
+-    if raw is None:
+-        raise ValueError(f"{_DRIVER_ENV} is required")
++    raw = read_driver_input(os.environ)
+     try:
+         decoded = base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8")
+     except Exception:
+diff --git a/src/tributo_broker_redis/redis_client.py b/src/tributo_broker_redis/redis_client.py
+index f11c228..e12c2ce 100644
+--- a/src/tributo_broker_redis/redis_client.py
++++ b/src/tributo_broker_redis/redis_client.py
+@@ -25,11 +25,12 @@ def _resolve_secret(reference: str | None) -> str | None:
+     if reference is None:
+         return None
+     if reference.startswith("env:"):
+-        value = os.environ.get(reference.removeprefix("env:"))
++        name = reference.removeprefix("env:")
++        value = os.environ.get(name)
+         if value:
+             return value
+         raise RedisCredentialUnavailable(
+-            "Redis credential environment variable is unavailable"
++            f"Redis credential environment variable is unavailable: {name}"
+         )
+     if reference.startswith("mount:"):
+         path = Path(reference.removeprefix("mount:"))
+diff --git a/src/tributo_broker_redis/reporter.py b/src/tributo_broker_redis/reporter.py
+index d8c626a..d4577a8 100644
+--- a/src/tributo_broker_redis/reporter.py
++++ b/src/tributo_broker_redis/reporter.py
+@@ -116,13 +116,21 @@ class RedisEventReporter:
+             {"level": level, "message": message[:4096]},
+         )
+ 
+-    def failed(self, code: str, error_type: str, phase: str) -> dict[str, Any]:
++    def failed(
++        self,
++        code: str,
++        error_type: str,
++        phase: str,
++        *,
++        sanitized_message: str = "operation failed",
++    ) -> dict[str, Any]:
++        """Publish a caller-approved summary; never pass raw external exceptions."""
+         return self.publish(
+             "FAILED",
+             {
+                 "error_code": code,
+                 "error_type": error_type,
+-                "sanitized_message": "operation failed",
++                "sanitized_message": sanitized_message,
+                 "retryable": False,
+             },
+             phase=phase,
+diff --git a/src/tributo_broker_redis/runtime.py b/src/tributo_broker_redis/runtime.py
+index ded86ba..728ea0a 100644
+--- a/src/tributo_broker_redis/runtime.py
++++ b/src/tributo_broker_redis/runtime.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import base64
+ import logging
++import time
+ from collections.abc import Callable, Iterable, Mapping
+ from pathlib import Path
+ from typing import Any, cast
+@@ -31,6 +32,7 @@ from tributo_broker_redis.config import (
+     normalize_config,
+ )
+ from tributo_broker_redis.consumer import RedisTaskConsumer
++from tributo_broker_redis.driver_transport import driver_transport
+ from tributo_broker_redis.operations import (
+     MappingFailure,
+     PreparedOperation,
+@@ -47,9 +49,11 @@ from tributo_broker_redis.reporter import RedisEventReporter
+ 
+ logger = logging.getLogger(__name__)
+ _DRIVER_ENV = "TRIBUTO_REDIS_DRIVER_INPUT_B64"
+-_MAX_DRIVER_INPUT_BYTES = 64 * 1024
+ _DEFAULT_DRIVER_ENTRYPOINT = "python -m tributo_broker_redis.execution_driver"
+-_ACTIVE_RAY_STATUSES = frozenset({"PENDING", "RUNNING"})
++_RECOVERABLE_RAY_STATUSES = frozenset(
++    {"PENDING", "RUNNING", "FAILED", "STOPPED", "SUCCEEDED"}
++)
++_PENDING_RECOVERY_INTERVAL_SECONDS = 1.0
+ 
+ 
+ def _list_ray_jobs(dashboard_url: str) -> Iterable[Any]:
+@@ -122,6 +126,7 @@ class RedisBrokerRuntime(BrokerRuntime):
+             reporter_factory=reporter_factory,
+         )
+         self._next_channel = 0
++        self._next_pending_recovery = 0.0
+         self._closed = False
+         self._started = False
+         if start_cancel_watcher:
+@@ -139,11 +144,33 @@ class RedisBrokerRuntime(BrokerRuntime):
+     def start(self) -> None:
+         if self._started:
+             return
++        logger.info(
++            "Starting Redis broker consumer: ray_dashboard=%s operations=%s",
++            self.config.execution.ray_dashboard_url,
++            ",".join(self._consumers),
++        )
+         self._recover_active_submissions()
+-        for consumer in self._consumers.values():
+-            consumer.recover_pending()
++        self._recover_pending()
+         self._cancel_watcher.start()
+         self._started = True
++        logger.info("Redis broker consumer started")
++
++    def _recover_pending(self) -> None:
++        """Advance one native XAUTOCLAIM page per channel at a bounded cadence."""
++        now = time.monotonic()
++        if now < self._next_pending_recovery:
++            return
++        self._next_pending_recovery = now + _PENDING_RECOVERY_INTERVAL_SECONDS
++        for consumer in self._consumers.values():
++            try:
++                consumer.recover_pending()
++            except Exception as exc:
++                logger.warning(
++                    "Pending delivery recovery failed; will retry: "
++                    "operation_type=%s error_type=%s",
++                    consumer.operation_type,
++                    type(exc).__name__,
++                )
+ 
+     def _recover_active_submissions(self) -> None:
+         """Rebuild cancellation/watchdog state from credential-free Ray metadata."""
+@@ -151,7 +178,7 @@ class RedisBrokerRuntime(BrokerRuntime):
+         for job in jobs:
+             raw_status = getattr(job, "status", "")
+             status = str(getattr(raw_status, "value", raw_status)).upper()
+-            if status not in _ACTIVE_RAY_STATUSES:
++            if status not in _RECOVERABLE_RAY_STATUSES:
+                 continue
+             metadata = getattr(job, "metadata", None)
+             if not isinstance(metadata, Mapping):
+@@ -216,6 +243,21 @@ class RedisBrokerRuntime(BrokerRuntime):
+                     ),
+                 )
+             )
++            recovered = self.active_submissions.get(cast(str, operation_id))
++            if recovered is not None and terminal_event_published(
++                self._redis, recovered
++            ):
++                self.active_submissions.remove(recovered.operation_id)
++                continue
++            logger.info(
++                "Recovered active Ray job: operation_id=%s operation_type=%s "
++                "submission_id=%s ray_job_id=%s status=%s",
++                operation_id,
++                operation_type,
++                submission_id,
++                ray_job_id or "<unknown>",
++                status,
++            )
+ 
+     def _resume_existing_submission(
+         self,
+@@ -246,9 +288,23 @@ class RedisBrokerRuntime(BrokerRuntime):
+                 ),
+             )
+         if terminal_event_published(self._redis, existing):
++            logger.info(
++                "Recovered operation is already terminal: operation_id=%s "
++                "submission_id=%s ray_job_id=%s",
++                request.operation_id,
++                existing.submission.submission_id,
++                existing.submission.ray_job_id or "<unknown>",
++            )
+             self.active_submissions.remove(request.operation_id)
+             return TaskOutcome(TaskDisposition.ACK)
+         try:
++            logger.info(
++                "Reconfirming recovered Ray admission: operation_id=%s "
++                "submission_id=%s ray_job_id=%s",
++                request.operation_id,
++                existing.submission.submission_id,
++                existing.submission.ray_job_id or "<unknown>",
++            )
+             self._reporter(
+                 operation_id=request.operation_id,
+                 operation_type=operation_type,
+@@ -320,6 +376,15 @@ class RedisBrokerRuntime(BrokerRuntime):
+         operation_id = message.metadata.get("outer_operation_id") or (
+             f"invalid-{message.delivery_token}"
+         )
++        logger.warning(
++            "Rejecting invalid Redis task: operation_type=%s operation_id=%s "
++            "delivery=%s code=%s message=%s",
++            operation_type,
++            operation_id,
++            message.delivery_token,
++            code,
++            sanitized_message,
++        )
+         try:
+             self._reporter(
+                 operation_id=operation_id,
+@@ -351,6 +416,12 @@ class RedisBrokerRuntime(BrokerRuntime):
+     def handle(self, message: Message) -> TaskOutcome:
+         operation_type = cast(OperationType, message.metadata["operation_type"])
+         outer_operation_id = message.metadata.get("outer_operation_id", "")
++        logger.debug(
++            "Handling Redis delivery: operation_type=%s operation_id=%s delivery=%s",
++            operation_type,
++            outer_operation_id or "<missing>",
++            message.delivery_token,
++        )
+         if not outer_operation_id:
+             return self._invalid(
+                 message,
+@@ -428,6 +499,12 @@ class RedisBrokerRuntime(BrokerRuntime):
+         )
+         try:
+             if bool(self._redis.exists(channel.cancel_key(request.operation_id))):
++                logger.info(
++                    "Operation cancelled before Ray admission: operation_id=%s "
++                    "operation_type=%s",
++                    request.operation_id,
++                    operation_type,
++                )
+                 reporter.publish(
+                     "CANCELLED",
+                     {"reason": "cancelled before admission"},
+@@ -435,6 +512,13 @@ class RedisBrokerRuntime(BrokerRuntime):
+                 )
+                 return TaskOutcome(TaskDisposition.ACK)
+         except Exception:
++            logger.warning(
++                "Could not check cancellation marker: operation_id=%s "
++                "operation_type=%s",
++                request.operation_id,
++                operation_type,
++                exc_info=True,
++            )
+             return TaskOutcome(
+                 TaskDisposition.RETRY,
+                 BrokerError(
+@@ -461,7 +545,18 @@ class RedisBrokerRuntime(BrokerRuntime):
+         encoded_driver_input = base64.urlsafe_b64encode(
+             driver_input.model_dump_json().encode("utf-8")
+         ).decode("ascii")
+-        if len(encoded_driver_input.encode("ascii")) > _MAX_DRIVER_INPUT_BYTES:
++        if (
++            len(encoded_driver_input.encode("ascii"))
++            > self.config.transport.max_driver_input_bytes
++        ):
++            logger.warning(
++                "Ray driver input exceeds configured limit: operation_id=%s "
++                "operation_type=%s bytes=%d limit=%d",
++                request.operation_id,
++                operation_type,
++                len(encoded_driver_input.encode("ascii")),
++                self.config.transport.max_driver_input_bytes,
++            )
+             return self._invalid(
+                 message,
+                 operation_type=operation_type,
+@@ -470,37 +565,58 @@ class RedisBrokerRuntime(BrokerRuntime):
+             )
+ 
+         env_vars = dict(self.config.execution.env_vars)
+-        env_vars[_DRIVER_ENV] = encoded_driver_input
+         try:
+-            submission = self._submitter(
+-                self._driver_entrypoint,
+-                operation_namespace=namespace,
+-                run_id=run_id,
+-                attempt_id=request.attempt_id,
+-                dashboard_url=self.config.execution.ray_dashboard_url,
+-                env_vars=env_vars,
+-                project_root=Path(self.config.execution.project_root)
+-                .expanduser()
+-                .resolve(),
+-                extra_py_modules=[
+-                    module
+-                    if "://" in module
+-                    else str(Path(module).expanduser().resolve())
+-                    for module in self.config.execution.extra_py_modules
+-                ],
+-                runtime_pip_packages=list(self.config.execution.runtime_pip_packages),
+-                metadata={
+-                    "tributo.operation_id": request.operation_id,
+-                    "tributo.operation_type": operation_type,
+-                    "tributo.execution_profile": request.execution_profile,
+-                    "tributo.protocol_profile": request.protocol_profile,
+-                    "tributo.run_id": run_id,
+-                    "tributo.attempt_id": request.attempt_id,
+-                    "tributo.driver_entrypoint": self._driver_entrypoint,
+-                    "tributo.task_stream": channel.task_stream_key,
+-                },
+-                request_digest=request.request_digest,
+-                entrypoint_num_cpus=self.config.execution.entrypoint_num_cpus,
++            logger.info(
++                "Submitting Ray job: operation_id=%s operation_type=%s "
++                "run_id=%s attempt_id=%s driver_input_bytes=%d",
++                request.operation_id,
++                operation_type,
++                run_id,
++                request.attempt_id,
++                len(encoded_driver_input.encode("ascii")),
++            )
++            modules = [
++                module if "://" in module else str(Path(module).expanduser().resolve())
++                for module in self.config.execution.extra_py_modules
++            ]
++            with driver_transport(encoded_driver_input, env_vars, modules) as (
++                env_vars,
++                modules,
++            ):
++                submission = self._submitter(
++                    self._driver_entrypoint,
++                    operation_namespace=namespace,
++                    run_id=run_id,
++                    attempt_id=request.attempt_id,
++                    dashboard_url=self.config.execution.ray_dashboard_url,
++                    env_vars=env_vars,
++                    project_root=Path(self.config.execution.project_root)
++                    .expanduser()
++                    .resolve(),
++                    extra_py_modules=modules,
++                    runtime_pip_packages=list(
++                        self.config.execution.runtime_pip_packages
++                    ),
++                    metadata={
++                        "tributo.operation_id": request.operation_id,
++                        "tributo.operation_type": operation_type,
++                        "tributo.execution_profile": request.execution_profile,
++                        "tributo.protocol_profile": request.protocol_profile,
++                        "tributo.run_id": run_id,
++                        "tributo.attempt_id": request.attempt_id,
++                        "tributo.driver_entrypoint": self._driver_entrypoint,
++                        "tributo.task_stream": channel.task_stream_key,
++                    },
++                    request_digest=request.request_digest,
++                    entrypoint_num_cpus=self.config.execution.entrypoint_num_cpus,
++                )
++            logger.info(
++                "Ray job admitted: operation_id=%s operation_type=%s "
++                "submission_id=%s ray_job_id=%s",
++                request.operation_id,
++                operation_type,
++                submission.submission_id,
++                submission.ray_job_id or "<unknown>",
+             )
+             active = ActiveSubmission(
+                 operation_id=request.operation_id,
+@@ -526,10 +642,20 @@ class RedisBrokerRuntime(BrokerRuntime):
+                 },
+                 phase="ADMITTED",
+             )
++            logger.info(
++                "Admission event published: operation_id=%s submission_id=%s "
++                "ray_job_id=%s",
++                request.operation_id,
++                submission.submission_id,
++                submission.ray_job_id or "<unknown>",
++            )
+         except Exception:
+             logger.warning(
+-                "Ray admission is not confirmed: operation_id=%s",
++                "Ray admission is not confirmed: operation_id=%s "
++                "operation_type=%s delivery=%s",
+                 request.operation_id,
++                operation_type,
++                message.delivery_token,
+                 exc_info=True,
+             )
+             return TaskOutcome(
+@@ -544,6 +670,15 @@ class RedisBrokerRuntime(BrokerRuntime):
+     def _apply_outcome(
+         self, consumer: RedisTaskConsumer, message: Message, outcome: TaskOutcome
+     ) -> None:
++        logger.debug(
++            "Applying Redis delivery outcome: operation_type=%s operation_id=%s "
++            "delivery=%s disposition=%s error_code=%s",
++            consumer.operation_type,
++            message.metadata.get("outer_operation_id") or "<missing>",
++            message.delivery_token,
++            outcome.disposition,
++            outcome.error.code if outcome.error else "<none>",
++        )
+         if outcome.disposition == TaskDisposition.ACK:
+             consumer.ack(message)
+         elif outcome.disposition == TaskDisposition.RETRY:
+@@ -552,6 +687,7 @@ class RedisBrokerRuntime(BrokerRuntime):
+             consumer.reject(message, outcome.error)
+ 
+     def run_once(self, timeout_ms: int | None = None) -> bool:
++        self._recover_pending()
+         operations: tuple[OperationType, ...] = ("training", "batch_inference")
+         per_channel_timeout = (
+             self.config.transport.block_ms
+@@ -580,10 +716,12 @@ class RedisBrokerRuntime(BrokerRuntime):
+         if self._closed:
+             return
+         self._closed = True
++        logger.info("Stopping Redis broker consumer")
+         self._cancel_watcher.close()
+         close = getattr(self._redis, "close", None)
+         if callable(close):
+             close()
++        logger.info("Redis broker consumer stopped")
+ 
+ 
+ def create_runtime(config: Mapping[str, Any]) -> RedisBrokerRuntime:
+diff --git a/tests/unit/test_runtime_cancellation_events.py b/tests/unit/test_runtime_cancellation_events.py
+index 3f473c4..2b8078b 100644
+--- a/tests/unit/test_runtime_cancellation_events.py
++++ b/tests/unit/test_runtime_cancellation_events.py
+@@ -1022,10 +1022,12 @@ def test_terminal_event_is_found_when_a_later_nonterminal_event_exists(
+     assert len(fake_redis.events[stream]) == event_count
+ 
+ 
++@pytest.mark.parametrize("status", ["RUNNING", "FAILED", "STOPPED", "SUCCEEDED"])
+ def test_start_recovers_pending_deliveries_and_active_ray_jobs(
+     config: RedisBrokerConfig,
+     fake_redis: FakeRedis,
+     monkeypatch: pytest.MonkeyPatch,
++    status: str,
+ ) -> None:
+     recovered: list[str] = []
+ 
+@@ -1039,7 +1041,7 @@ def test_start_recovers_pending_deliveries_and_active_ray_jobs(
+         recover_pending,
+     )
+     job = SimpleNamespace(
+-        status="RUNNING",
++        status=status,
+         submission_id="submission-recovered",
+         job_id="ray-job-recovered",
+         metadata={
+@@ -1073,6 +1075,25 @@ def test_start_recovers_pending_deliveries_and_active_ray_jobs(
+     assert item.run_id == "run-recovered"
+     assert item.submission.attempt_id == "attempt-2"
+     assert item.submission.request_digest == "a" * 64
++    if status != "RUNNING":
++        runtime._cancel_watcher._status_getter = lambda *args, **kwargs: status
++        runtime._cancel_watcher.check_once()
++        event = json.loads(
++            fake_redis.events[
++                config.channels.training.event_stream_key(item.operation_id)
++            ][-1]["payload"]
++        )
++        assert event["event_type"] == "FAILED"
++        assert runtime.active_submissions.get(item.operation_id) is None
++        runtime.close()
++        # A later restart must not publish the fallback again.
++        restarted = RedisBrokerRuntime(
++            config, redis_client=fake_redis, job_lister=lambda _url: [job]
++        )
++        monkeypatch.setattr(restarted._cancel_watcher, "start", lambda: None)
++        restarted.start()
++        assert restarted.active_submissions.snapshot() == ()
++        restarted.close()
+ 
+ 
+ def test_recovered_delivery_reuses_active_ray_job_without_resubmission(
+diff --git a/src/tributo_broker_redis/driver_transport.py b/src/tributo_broker_redis/driver_transport.py
+new file mode 100644
+index 0000000..2e9921b
+--- /dev/null
++++ b/src/tributo_broker_redis/driver_transport.py
+@@ -0,0 +1,60 @@
++"""Use Ray's native py_modules upload for inputs too large for process env."""
++
++from __future__ import annotations
++
++import importlib.resources
++from collections.abc import Iterator, Mapping
++from contextlib import contextmanager
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++DRIVER_ENV = "TRIBUTO_REDIS_DRIVER_INPUT_B64"
++RESOURCE_ENV = "TRIBUTO_REDIS_DRIVER_INPUT_RESOURCE"
++PACKAGE = "tributo_ray_driver_input"
++INLINE_LIMIT = 48 * 1024
++
++
++@contextmanager
++def driver_transport(
++    encoded: str, env_vars: Mapping[str, str], modules: list[str]
++) -> Iterator[tuple[dict[str, str], list[str]]]:
++    """Keep files until submit_job finishes its synchronous package upload.
++
++    Linux limits each argument/environment string independently of ARG_MAX.
++    Splitting env vars is insufficient: Ray also serializes runtime_env for
++    worker startup. A small native Ray package avoids both process limits.
++    """
++    env = dict(env_vars)
++    env.pop(DRIVER_ENV, None)
++    env.pop(RESOURCE_ENV, None)
++    if len(encoded) <= INLINE_LIMIT:
++        env[DRIVER_ENV] = encoded
++        yield env, modules
++        return
++    with TemporaryDirectory(prefix="tributo-driver-") as directory:
++        package = Path(directory) / PACKAGE
++        package.mkdir(mode=0o700)
++        (package / "__init__.py").write_text("", encoding="utf-8")
++        payload = package / "input.b64"
++        payload.touch(mode=0o600)
++        payload.write_text(encoded, encoding="ascii")
++        env[RESOURCE_ENV] = PACKAGE
++        yield env, [*modules, str(package)]
++
++
++def read_driver_input(env: Mapping[str, str]) -> str:
++    inline = env.get(DRIVER_ENV)
++    resource = env.get(RESOURCE_ENV)
++    if inline is not None and resource is not None:
++        raise ValueError("driver input has conflicting transports")
++    if inline is not None:
++        return inline
++    if resource is not None:
++        if resource != PACKAGE:
++            raise ValueError("driver input resource is not recognized")
++        return (
++            importlib.resources.files(PACKAGE)
++            .joinpath("input.b64")
++            .read_text(encoding="ascii")
++        )
++    raise ValueError(f"{DRIVER_ENV} is required (or native Ray input package)")
+diff --git a/tests/test_driver_transport.py b/tests/test_driver_transport.py
+new file mode 100644
+index 0000000..67bde15
+--- /dev/null
++++ b/tests/test_driver_transport.py
+@@ -0,0 +1,59 @@
++import importlib
++import sys
++from pathlib import Path
++
++import pytest
++
++from tributo_broker_redis.driver_transport import (
++    DRIVER_ENV,
++    INLINE_LIMIT,
++    PACKAGE,
++    RESOURCE_ENV,
++    driver_transport,
++    read_driver_input,
++)
++
++
++@pytest.mark.parametrize("size", [0, 1, INLINE_LIMIT - 1, INLINE_LIMIT])
++def test_inline_boundary(size):
++    payload = "x" * size
++    with driver_transport(
++        payload, {RESOURCE_ENV: "stale", "PATH": "/bin"}, ["/existing"]
++    ) as (env, modules):
++        assert read_driver_input(env) == payload
++        assert RESOURCE_ENV not in env
++        assert modules == ["/existing"]
++        assert env["PATH"] == "/bin"
++
++
++@pytest.mark.parametrize("size", [INLINE_LIMIT + 1, 131072, 262144])
++def test_large_native_package_roundtrip_and_cleanup(size, monkeypatch):
++    payload = "x" * size
++    with driver_transport(payload, {DRIVER_ENV: "stale"}, []) as (env, modules):
++        assert DRIVER_ENV not in env
++        assert env[RESOURCE_ENV] == PACKAGE
++        package = Path(modules[0])
++        monkeypatch.syspath_prepend(str(package.parent))
++        importlib.invalidate_caches()
++        sys.modules.pop(PACKAGE, None)
++        assert read_driver_input(env) == payload
++        assert package.joinpath("input.b64").stat().st_mode & 0o777 == 0o600
++        sys.modules.pop(PACKAGE, None)
++    assert not package.exists()
++
++
++def test_cleanup_on_failed_submission():
++    with pytest.raises(RuntimeError):
++        with driver_transport("x" * 60000, {}, []) as (_, modules):
++            path = Path(modules[0])
++            raise RuntimeError("upload failed")
++    assert not path.exists()
++
++
++@pytest.mark.parametrize(
++    "env",
++    [{}, {RESOURCE_ENV: "../../secret"}, {DRIVER_ENV: "x", RESOURCE_ENV: PACKAGE}],
++)
++def test_reject_invalid_transports(env):
++    with pytest.raises(ValueError):
++        read_driver_input(env)
+diff --git a/tests/unit/test_pending_recovery.py b/tests/unit/test_pending_recovery.py
+new file mode 100644
+index 0000000..cbc532c
+--- /dev/null
++++ b/tests/unit/test_pending_recovery.py
+@@ -0,0 +1,231 @@
++"""Pending recovery uses Redis pagination and the existing Ray identity map."""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++from conftest import FakeRedis
++from tributo.ray_jobs import RayJobSubmission
++
++from tributo_broker_redis.config import RedisBrokerConfig
++from tributo_broker_redis.consumer import RedisTaskConsumer
++from tributo_broker_redis.operations import PreparedOperation
++from tributo_broker_redis.runtime import RedisBrokerRuntime
++
++
++def _delivery(index: int) -> tuple[str, dict[str, str]]:
++    operation_id = f"operation-{index}"
++    return (
++        f"{index}-0",
++        {
++            "operation_id": operation_id,
++            "payload": json.dumps(
++                {
++                    "protocol_profile": "tributo-generic-v1",
++                    "protocol_version": "1.0",
++                    "operation_id": operation_id,
++                    "operation_type": "training",
++                    "execution_profile": "single_worker",
++                    "run_id": operation_id,
++                    "attempt_id": "attempt-1",
++                    "request_digest": "d" * 64,
++                    "spec": {},
++                }
++            ),
++        },
++    )
++
++
++def _runtime(
++    config: RedisBrokerConfig,
++    redis: FakeRedis,
++    monkeypatch: pytest.MonkeyPatch,
++) -> tuple[RedisBrokerRuntime, list[float], list[dict[str, Any]]]:
++    clock = [0.0]
++    submissions: list[dict[str, Any]] = []
++    monkeypatch.setattr(
++        "tributo_broker_redis.runtime.time",
++        SimpleNamespace(monotonic=lambda: clock[0]),
++    )
++
++    def submit(_entrypoint: str, **kwargs: Any) -> RayJobSubmission:
++        submissions.append(kwargs)
++        return RayJobSubmission(
++            run_id=kwargs["run_id"],
++            attempt_id=kwargs["attempt_id"],
++            submission_id=f"submission-{len(submissions)}",
++            request_digest=kwargs["request_digest"],
++        )
++
++    runtime = RedisBrokerRuntime(
++        config,
++        redis_client=redis,
++        submitter=submit,
++        # Recovery behavior is independent of workload-specific configuration.
++        operation_preparer=lambda _request: PreparedOperation(
++            operation_payload={}, credential_ref=None
++        ),
++        job_lister=lambda _url: [],
++    )
++    monkeypatch.setattr(runtime._cancel_watcher, "start", lambda: None)
++    return runtime, clock, submissions
++
++
++def test_runtime_advances_all_pending_pages_and_restarts_scan(
++    config: RedisBrokerConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cursors: list[str] = []
++    pages = {
++        "0-0": ["2-0", [_delivery(1)]],
++        "2-0": ["3-0", [_delivery(2)]],
++        "3-0": ["0-0", [_delivery(3)]],
++    }
++
++    def claim(stream: str, *_args: Any, start_id: str, **_kwargs: Any) -> list[Any]:
++        if stream != config.channels.training.task_stream_key:
++            return ["0-0", []]
++        cursors.append(start_id)
++        if len(fake_redis.acked) == 3:
++            return ["0-0", []]
++        return pages[start_id]
++
++    monkeypatch.setattr(fake_redis, "xautoclaim", claim, raising=False)
++    runtime, clock, submissions = _runtime(config, fake_redis, monkeypatch)
++    runtime.start()
++    assert runtime.run_once(timeout_ms=0)
++    for instant in (1.0, 2.0):
++        clock[0] = instant
++        assert runtime.run_once(timeout_ms=0)
++    clock[0] = 3.0
++    assert not runtime.run_once(timeout_ms=0)
++
++    assert cursors == ["0-0", "2-0", "3-0", "0-0"]
++    assert len(submissions) == 3
++    assert [entry[2] for entry in fake_redis.acked] == ["1-0", "2-0", "3-0"]
++    runtime.close()
++
++
++def test_pending_delivery_is_discovered_after_reaching_idle_threshold(
++    config: RedisBrokerConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    config = config.model_copy(
++        update={
++            "transport": config.transport.model_copy(update={"claim_idle_ms": 2000})
++        }
++    )
++    runtime, clock, submissions = _runtime(config, fake_redis, monkeypatch)
++    training_scans: list[float] = []
++
++    def claim(
++        stream: str, *_args: Any, min_idle_time: int, **_kwargs: Any
++    ) -> list[Any]:
++        if stream != config.channels.training.task_stream_key:
++            return ["0-0", []]
++        training_scans.append(clock[0])
++        eligible = clock[0] * 1000 >= min_idle_time and not fake_redis.acked
++        return ["0-0", [_delivery(1)] if eligible else []]
++
++    monkeypatch.setattr(fake_redis, "xautoclaim", claim, raising=False)
++    runtime.start()
++    for instant in (0.0, 0.5, 1.0, 1.5):
++        clock[0] = instant
++        assert not runtime.run_once(timeout_ms=0)
++    clock[0] = 2.0
++    assert runtime.run_once(timeout_ms=0)
++
++    assert training_scans == [0.0, 1.0, 2.0]
++    assert len(submissions) == len(fake_redis.acked) == 1
++    runtime.close()
++
++
++def test_claimed_page_is_drained_before_claiming_again(
++    config: RedisBrokerConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    calls: list[int] = []
++
++    def claim(*_args: Any, **_kwargs: Any) -> list[Any]:
++        calls.append(1)
++        return ["0-0", [_delivery(1), _delivery(2)]]
++
++    monkeypatch.setattr(fake_redis, "xautoclaim", claim, raising=False)
++    consumer = RedisTaskConsumer(
++        fake_redis,
++        config.transport.model_copy(update={"claim_idle_ms": 0}),
++        config.channels.training,
++        "training",
++    )
++    assert consumer.recover_pending() == 2
++    for _ in range(3):
++        assert consumer.recover_pending() == 0
++    assert consumer.poll(0).delivery_token == "1-0"
++    assert consumer.recover_pending() == 0
++    assert consumer.poll(0).delivery_token == "2-0"
++    assert calls == [1]
++
++
++def test_reclaimed_unacked_admission_reuses_active_ray_submission(
++    config: RedisBrokerConfig, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    def claim(stream: str, *_args: Any, **_kwargs: Any) -> list[Any]:
++        eligible = (
++            stream == config.channels.training.task_stream_key and not fake_redis.acked
++        )
++        return ["0-0", [_delivery(1)] if eligible else []]
++
++    original_xadd = fake_redis.xadd
++    attempts: list[int] = []
++
++    def flaky_xadd(*args: Any, **kwargs: Any) -> str:
++        attempts.append(1)
++        if len(attempts) <= 2:
++            raise ConnectionError("synthetic event publication failure")
++        return original_xadd(*args, **kwargs)
++
++    monkeypatch.setattr(fake_redis, "xautoclaim", claim, raising=False)
++    monkeypatch.setattr(fake_redis, "xadd", flaky_xadd)
++    runtime, clock, submissions = _runtime(config, fake_redis, monkeypatch)
++    runtime.start()
++    for instant in (0.0, 1.0):
++        clock[0] = instant
++        assert runtime.run_once(timeout_ms=0)
++        assert fake_redis.acked == []
++        assert len(submissions) == 1
++    clock[0] = 2.0
++    assert runtime.run_once(timeout_ms=0)
++
++    assert len(submissions) == len(fake_redis.acked) == 1
++    assert len(attempts) == 3
++    event = json.loads(next(iter(fake_redis.events.values()))[-1]["payload"])
++    assert event["payload"]["recovered"] is True
++    runtime.close()
++
++
++def test_pending_recovery_retries_transient_redis_error_without_hot_loop(
++    config: RedisBrokerConfig,
++    fake_redis: FakeRedis,
++    monkeypatch: pytest.MonkeyPatch,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    calls: list[str] = []
++
++    def claim(stream: str, *_args: Any, **_kwargs: Any) -> list[Any]:
++        calls.append(stream)
++        if len(calls) <= 2:
++            raise ConnectionError("synthetic claim failure")
++        return ["0-0", []]
++
++    monkeypatch.setattr(fake_redis, "xautoclaim", claim, raising=False)
++    runtime, clock, _submissions = _runtime(config, fake_redis, monkeypatch)
++    runtime.start()
++    for _ in range(5):
++        assert not runtime.run_once(timeout_ms=0)
++    assert len(calls) == 2
++    clock[0] = 1.0
++    assert not runtime.run_once(timeout_ms=0)
++    assert len(calls) == 4
++    assert "synthetic claim failure" not in caplog.text
++    assert "error_type=ConnectionError" in caplog.text
++    runtime.close()
+diff --git a/tests/unit/test_reporter_failure_summary.py b/tests/unit/test_reporter_failure_summary.py
+new file mode 100644
+index 0000000..2936ce8
+--- /dev/null
++++ b/tests/unit/test_reporter_failure_summary.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++import json
++
++import pytest
++from conftest import FakeRedis
++
++from tributo_broker_redis.reporter import RedisEventReporter
++
++
++@pytest.mark.parametrize("summary", [None, "features must be a non-empty array"])
++def test_failed_retains_default_and_accepts_caller_approved_summary(
++    fake_redis: FakeRedis, summary: str | None
++) -> None:
++    reporter = RedisEventReporter(
++        fake_redis,
++        event_stream_prefix="events:training",
++        operation_id="operation-1",
++        operation_type="training",
++        execution_profile="distributed",
++        run_id="run-1",
++        attempt_id="attempt-1",
++    )
++    kwargs = {} if summary is None else {"sanitized_message": summary}
++
++    reporter.failed("EXECUTION_FAILED", "ConfigurationError", "PREPARING", **kwargs)
++
++    event = json.loads(fake_redis.events[reporter.stream_key][-1]["payload"])
++    assert event["phase"] == "PREPARING"
++    assert event["payload"] == {
++        "error_code": "EXECUTION_FAILED",
++        "error_type": "ConfigurationError",
++        "sanitized_message": "operation failed" if summary is None else summary,
++        "retryable": False,
++    }

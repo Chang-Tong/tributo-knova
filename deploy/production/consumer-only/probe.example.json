@@ -1,0 +1,32 @@
+{
+  "min_alive_nodes": 2,
+  "min_total_cpus": 2,
+  "require_idle": true,
+  "algorithms": [
+    "xgboost"
+  ],
+  "inference_formats": [
+    "onnx"
+  ],
+  "required_env": [
+    "KNOVA_REDIS_PASSWORD",
+    "KNOVA_REDIS_SENTINEL_PASSWORD"
+  ],
+  "s3": {
+    "bucket": "YOUR_BUCKET",
+    "endpoint_url": "http://YOUR_S3:9000",
+    "access_key_ref": "env:AWS_ACCESS_KEY_ID",
+    "secret_key_ref": "env:AWS_SECRET_ACCESS_KEY"
+  },
+  "clickhouse": {
+    "host": "YOUR_CLICKHOUSE",
+    "port": 8123,
+    "database": "knova",
+    "username": "knova",
+    "password_ref": "env:KNOVA_CLICKHOUSE_PASSWORD",
+    "secure": false,
+    "input_table": "knova.YOUR_INPUT_TABLE",
+    "output_table": "knova.YOUR_OUTPUT_TABLE"
+  },
+  "redis_stream_permissions": true
+}

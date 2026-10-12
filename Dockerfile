@@ -10,11 +10,22 @@ WORKDIR /app
 ENV UV_PYTHON_DOWNLOADS=0 \
     UV_PROJECT_ENVIRONMENT=/opt/tributo-knova
 
-# Keep dependency installation cacheable when application sources change.
+# The four project-specific packages are pinned in uv.lock to public Git
+# commits. Their pure-Python wheels are checked in for air-gapped builds; uv
+# still installs every transitive dependency from the configured internal
+# package index.
 COPY pyproject.toml uv.lock README.md ./
+COPY vendor/wheels ./vendor/wheels
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --frozen --no-dev --no-editable \
+        --no-install-package ray-clickhouse \
+        --no-install-package tributo \
+        --no-install-package tributo-algorithms-boosting \
+        --no-install-package tributo-broker-redis \
+    && uv pip install --no-config \
+        --python /opt/tributo-knova/bin/python --no-deps \
+        ./vendor/wheels/*.whl
 
 # The runtime image is mirrored inside RDCloud and already contains the Debian
 # trixie C/C++ runtime libraries required by the prebuilt Python wheels.

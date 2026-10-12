@@ -6,7 +6,8 @@
     "url": "redis://redis:6379/0",
     "driver_url": "redis://redis:6379/0",
     "block_ms": 1000,
-    "claim_idle_ms": 60000
+    "claim_idle_ms": 60000,
+    "max_driver_input_bytes": 262144
   },
   "channels": {
     "training": {

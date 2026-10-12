@@ -1,0 +1,81 @@
+{
+  "release": "v2.7",
+  "status": "kind_core_verified",
+  "scope": "consumer-only deployment and constant binary positive0 Kind regression; complete business matrix reported separately",
+  "architecture": "linux/arm64",
+  "image": "knova-tributo-devbox:v2.7",
+  "image_config_id": "sha256:b49ce75601f0c845063ad4bb9e0d4190df488a53b8145dfc6cdf24249f7388cb",
+  "image_archive": {
+    "name": "knova-tributo-devbox-arm64-v2.7.tar.zst",
+    "bytes": 536663424,
+    "sha256": "0bd63880f82c1b2770678ad8a53ea0eb1a00cfaec2157f08f9b653a02834d867",
+    "included_in_ops_package": false,
+    "docker_import_verified": true,
+    "containerd_nerdctl_full_import_verified": false
+  },
+  "kind_core_cases": {
+    "release": "v2.7",
+    "total": 5,
+    "passed": 5
+  },
+  "kind_business": {
+    "business_passed": true,
+    "training_rows": 1000,
+    "inference_rows": 500,
+    "unique_entities": 500,
+    "max_shap_probability_error": 1.1311439562788905e-08,
+    "positive_class_index": 0,
+    "fixture_constant_features": true,
+    "fixture_target_class1_fraction": 0.2,
+    "oracle_input": "ClickHouse source feature values by entity_id",
+    "native_verified_output_rows": 500,
+    "native_artifact_sha256_verified": true,
+    "native_feature_names_metadata_verified": true,
+    "oracle_replayed_existing_business": true,
+    "native_p1_min": 0.20000000298023224,
+    "native_p1_max": 0.20000000298023224,
+    "max_native_probability_error": 1.4901161193847656e-08,
+    "max_native_contribution_error": 0.0,
+    "max_native_margin_error": 0.0,
+    "max_source_feature_echo_error": 0.0,
+    "job_id": "kind-training-471ac2783b",
+    "execution_id": "kind-inference-471ac2783b",
+    "actual_operation_durations": [
+      {
+        "operation_id": "kind-training-471ac2783b",
+        "seconds": 180.36
+      },
+      {
+        "operation_id": "kind-inference-471ac2783b",
+        "seconds": 72.2
+      }
+    ]
+  },
+  "historical_script_regression": {
+    "release": "v2.6",
+    "deployment_unit_tests_passed": 66,
+    "kind_cases_passed": 19,
+    "production_script_logic_unchanged": true,
+    "v26_image_rejected_as_final": true
+  },
+  "existing_deployments_unchanged": {
+    "count": 7,
+    "uid_and_spec": true
+  },
+  "job_log_evidence_passed": true,
+  "local_cluster_deleted": true,
+  "production_deployment_tested": false,
+  "script_sha256": {
+    "deploy.py": "19e7c771309d4dda37bd5da3fefc06a678a9b7330287be02e124f7b507bab70c",
+    "doctor.py": "9cd663756300198fa5eea763827e0e76c2b8f3864d3b00114a10ea26f6634a22",
+    "import-image.sh": "dd10da6be66547bb2608d5e7f766a5b51f53a60dfc373ad66941621ab054a62c"
+  },
+  "known_resource_limit_gap": {
+    "resource_limits.early_stopping_patience": "accepted but not executed",
+    "resource_limits.max_training_time_seconds": "accepted but not executed",
+    "effective_controls": [
+      "resource_limits.max_epochs",
+      "algorithm.hyper_params.early_stopping_rounds"
+    ]
+  }
+}

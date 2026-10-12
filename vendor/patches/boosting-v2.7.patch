@@ -1,0 +1,623 @@
+diff --git a/packages/boosting/src/tributo_algorithms_boosting/native.py b/packages/boosting/src/tributo_algorithms_boosting/native.py
+index ea271a9..0632d16 100644
+--- a/packages/boosting/src/tributo_algorithms_boosting/native.py
++++ b/packages/boosting/src/tributo_algorithms_boosting/native.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import math
+ import time
+ from dataclasses import dataclass
+ from typing import Any, ClassVar, Mapping, cast
+@@ -159,6 +160,55 @@ class OfficialXGBoostONNXExporter:
+             ],
+             target_opset=int(target.typed_options.get("opset", 15)),
+         )
++        configuration = json.loads(booster.save_config())["learner"]
++        if configuration["objective"]["name"] == "binary:logistic":
++            from onnx import helper
++
++            # XGBoost stores logistic base_score as a probability; the ONNX
++            # TreeEnsembleClassifier base_values are untransformed margins.
++            # onnxmltools skips that conversion when its first tree is a zero
++            # leaf, which occurs for constant features and trained intercepts.
++            raw_score = json.loads(configuration["learner_model_param"]["base_score"])
++            scores = raw_score if isinstance(raw_score, list) else [raw_score]
++            if len(scores) != 1 or not 0 < float(scores[0]) < 1:
++                raise ValueError("Binary XGBoost base score is invalid")
++            probability = float(scores[0])
++            margin = math.log(probability) - math.log1p(-probability)
++            classifiers = [
++                node
++                for node in converted.graph.node
++                if node.domain == "ai.onnx.ml"
++                and node.op_type == "TreeEnsembleClassifier"
++            ]
++            if len(classifiers) != 1:
++                raise ValueError("Binary XGBoost ONNX classifier structure is invalid")
++            classifier = classifiers[0]
++            attributes = [a for a in classifier.attribute if a.name != "base_values"]
++            del classifier.attribute[:]
++            classifier.attribute.extend(attributes)
++            classifier.attribute.append(helper.make_attribute("base_values", [margin]))
++        contract = source.checkpoint_contract
++        if contract is not None:
++            from onnx import helper
++
++            expected = contract.output_schema
++            if len(converted.graph.output) != len(expected):
++                raise ValueError("ONNX outputs do not match checkpoint output count")
++            for output, field in zip(converted.graph.output, expected, strict=True):
++                if output.name != field.name:
++                    # onnxmltools names regression output ``variable`` while
++                    # the native runtime and checkpoint expose ``prediction``.
++                    # An ONNX Identity preserves values and the graph internals.
++                    converted.graph.node.append(
++                        helper.make_node("Identity", [output.name], [field.name])
++                    )
++                    if not any(item.domain == "" for item in converted.opset_import):
++                        converted.opset_import.append(
++                            helper.make_opsetid(
++                                "", int(target.typed_options.get("opset", 15))
++                            )
++                        )
++                    output.name = field.name
+         converted.graph.name = "tributo-official-xgboost"
+         path = context.artifact_dir / "model.onnx"
+         path.write_bytes(converted.SerializeToString())
+diff --git a/packages/boosting/src/tributo_algorithms_boosting/training.py b/packages/boosting/src/tributo_algorithms_boosting/training.py
+index 8f32f0c..19e61df 100644
+--- a/packages/boosting/src/tributo_algorithms_boosting/training.py
++++ b/packages/boosting/src/tributo_algorithms_boosting/training.py
+@@ -14,7 +14,7 @@ import math
+ import queue as stdlib_queue
+ import tempfile
+ import threading
+-from collections.abc import Iterator, Mapping, Sequence
++from collections.abc import Callable, Iterator, Mapping, Sequence
+ from contextlib import suppress
+ from pathlib import Path
+ from typing import Any, Protocol, cast, runtime_checkable
+@@ -438,7 +438,7 @@ def _split_dataset(
+     if strategy not in {"RANDOM", "TIME_ORDERED"}:
+         raise ValueError("training.split_strategy must be RANDOM or TIME_ORDERED")
+     source = (
+-        dataset.random_shuffle(seed=int(training.get("seed", 42)))
++        dataset.randomize_block_order(seed=int(training.get("seed", 42)))
+         if strategy == "RANDOM"
+         else dataset
+     )
+@@ -485,14 +485,12 @@ def _ensure_worker_blocks(
+ ) -> Any:
+     if row_count < worker_count:
+         raise ValueError(f"{name} dataset has fewer rows than XGBoost workers")
+-    try:
+-        block_count = dataset.num_blocks()
+-    except NotImplementedError:
+-        dataset = dataset.materialize()
+-        block_count = dataset.num_blocks()
+-    if block_count < worker_count:
+-        dataset = dataset.repartition(worker_count, strict=True, shuffle=False)
+-    return dataset
++    # Filtering can leave many empty blocks, so num_blocks() does not establish
++    # that each worker will receive rows. Ray's lossless streaming split assigns
++    # whole blocks; balance their rows first using its native split/combine path.
++    # With at least one row per worker this produces nonempty worker blocks and
++    # retains the remainder, unlike streaming_split(equal=True).
++    return dataset.repartition(worker_count, shuffle=False)
+ 
+ 
+ def _load_booster(checkpoint: Any, feature_names: tuple[str, ...]) -> Any:
+@@ -515,6 +513,7 @@ def _predict_batch(
+     label_name: str,
+     task_type: str,
+     num_class: int | None,
++    positive_label: int = 1,
+ ) -> Any:
+     import pandas as pd
+     import xgboost
+@@ -528,7 +527,7 @@ def _predict_batch(
+         for index in range(classes):
+             result[f"probability_{index}"] = values[:, index]
+     elif task_type == "BINARY_CLASSIFICATION":
+-        result["probability"] = values
++        result["probability"] = values if positive_label == 1 else 1 - values
+     else:
+         result["prediction"] = values
+     return pd.DataFrame(result)
+@@ -633,6 +632,7 @@ def _evaluation(
+     task_type: str,
+     num_class: int | None,
+     artifacts: Mapping[str, Any],
++    positive_label: int = 1,
+ ) -> tuple[dict[str, float], dict[str, Any]]:
+     if dataset is None:
+         return {}, {}
+@@ -649,6 +649,7 @@ def _evaluation(
+             "label_name": label_name,
+             "task_type": task_type,
+             "num_class": num_class,
++            "positive_label": positive_label,
+         },
+     ).materialize()
+     metrics: dict[str, float]
+@@ -665,7 +666,7 @@ def _evaluation(
+             probability = frame["probability"].to_numpy(dtype=np.float64)
+             if not np.isfinite(probability).all():
+                 raise ValueError("XGBoost prediction contains a non-finite score")
+-            positive = labels == 1
++            positive = labels == positive_label
+             predicted = probability >= 0.5
+             total_rows += int(len(labels))
+             total_positive += int(positive.sum())
+@@ -691,7 +692,7 @@ def _evaluation(
+         auc, average_precision, curve = _binary_ranking_metrics(
+             predictions,
+             probability_column="probability",
+-            positive_label=1,
++            positive_label=positive_label,
+             total_rows=total_rows,
+             total_positive=total_positive,
+             include_curve=bool(artifacts.get("roc_curve", False)),
+@@ -1073,8 +1074,15 @@ def run_xgboost_training(
+     num_class: int | None = None,
+     evaluation_artifacts: Mapping[str, Any] | None = None,
+     reporter: TrainingReporter | None = None,
++    ray_dataset_transform: Callable[[Any], Any] | None = None,
+ ) -> AlgorithmRunResult:
+-    """Run split-aware distributed XGBoost and return a complete Tributo result."""
++    """Run split-aware distributed XGBoost and return a complete Tributo result.
++
++    ``ray_dataset_transform`` is an optional driver-side composition hook for
++    application adapters that need a bounded Ray Data operation after
++    canonical ingestion and before the train/validation/test split. The hook
++    must return a Ray Dataset and never owns the ingestion lifecycle.
++    """
+     import importlib.metadata
+ 
+     import ray
+@@ -1101,6 +1109,16 @@ def run_xgboost_training(
+     model_params = _validated_model_params(
+         algorithm_config, task_type=task_type, num_class=num_class
+     )
++    training = algorithm_config.get("training", {})
++    if not isinstance(training, Mapping):
++        raise TypeError("training configuration must be an object")
++    positive_label = training.get("positive_label", 1)
++    if (
++        not isinstance(positive_label, int)
++        or isinstance(positive_label, bool)
++        or positive_label not in {0, 1}
++    ):
++        raise ValueError("training.positive_label must be the integer 0 or 1")
+     callback: TrainingReporter = reporter or _NullReporter()
+     artifacts = evaluation_artifacts or {}
+     gateway = IngestionGateway()
+@@ -1112,10 +1130,12 @@ def run_xgboost_training(
+     try:
+         if not isinstance(opened.handle, RayDataHandle):
+             raise TypeError("training ingestion must return a RayDataHandle")
+-        dataset = opened.handle.dataset.materialize()
+-        training = algorithm_config.get("training", {})
+-        if not isinstance(training, Mapping):
+-            raise TypeError("training configuration must be an object")
++        dataset = opened.handle.dataset
++        if ray_dataset_transform is not None:
++            dataset = ray_dataset_transform(dataset)
++            if dataset is None or not callable(getattr(dataset, "materialize", None)):
++                raise TypeError("ray_dataset_transform must return a Ray Dataset")
++        dataset = dataset.materialize()
+         callback.phase("DATA_SPLITTING")
+         train_dataset, validation_dataset, test_dataset, rows = _split_dataset(
+             dataset, training
+@@ -1234,6 +1254,7 @@ def run_xgboost_training(
+             task_type=task_type,
+             num_class=num_class,
+             artifacts=artifacts,
++            positive_label=positive_label,
+         )
+         correlation_matrix = None
+         if artifacts.get("correlation_matrix", False):
+diff --git a/tests/test_xgboost_training.py b/tests/test_xgboost_training.py
+index e45127c..e9cac2b 100644
+--- a/tests/test_xgboost_training.py
++++ b/tests/test_xgboost_training.py
+@@ -21,7 +21,7 @@ class _Dataset:
+     def count(self) -> int:
+         return self.rows
+ 
+-    def random_shuffle(self, seed: int) -> _Dataset:
++    def randomize_block_order(self, seed: int) -> _Dataset:
+         self.random_seed = seed
+         return self
+ 
+@@ -34,15 +34,13 @@ class _Dataset:
+ class _BlockedDataset:
+     def __init__(self, blocks: int) -> None:
+         self.blocks = blocks
+-        self.repartition_call: tuple[int, bool, bool] | None = None
++        self.repartition_call: tuple[int, bool] | None = None
+ 
+     def num_blocks(self) -> int:
+         return self.blocks
+ 
+-    def repartition(
+-        self, blocks: int, *, strict: bool, shuffle: bool
+-    ) -> _BlockedDataset:
+-        self.repartition_call = (blocks, strict, shuffle)
++    def repartition(self, blocks: int, *, shuffle: bool) -> _BlockedDataset:
++        self.repartition_call = (blocks, shuffle)
+         self.blocks = blocks
+         return self
+ 
+@@ -147,15 +145,29 @@ def test_split_dataset_rejects_lossy_or_empty_split_contracts() -> None:
+         )
+ 
+ 
+-def test_worker_block_guard_repartitions_for_complete_worker_coverage() -> None:
+-    dataset = _BlockedDataset(1)
++@pytest.mark.parametrize("input_blocks", [1, 2, 75, 200])
++def test_worker_block_guard_repartitions_for_complete_worker_coverage(
++    input_blocks: int,
++) -> None:
++    dataset = _BlockedDataset(input_blocks)
+ 
+     result = runtime._ensure_worker_blocks(
+         dataset, worker_count=2, row_count=100, name="validation"
+     )
+ 
+     assert result is dataset
+-    assert dataset.repartition_call == (2, True, False)
++    assert dataset.repartition_call == (2, False)
++
++
++def test_worker_block_guard_rejects_fewer_rows_than_workers() -> None:
++    dataset = _BlockedDataset(200)
++
++    with pytest.raises(ValueError, match="fewer rows than XGBoost workers"):
++        runtime._ensure_worker_blocks(
++            dataset, worker_count=2, row_count=1, name="validation"
++        )
++
++    assert dataset.repartition_call is None
+ 
+ 
+ def test_round_metrics_normalize_error_and_join_train_validation() -> None:
+@@ -265,6 +277,54 @@ def test_binary_evaluation_uses_every_test_row_and_builds_artifacts() -> None:
+     assert len(details["threshold_analysis"]["predicted_positive_rows"]) == 19
+ 
+ 
++@pytest.mark.parametrize("positive_label", [0, 1])
++def test_binary_evaluation_uses_selected_positive_class(positive_label: int) -> None:
++    from sklearn import metrics as expected
++
++    frame = pd.DataFrame(
++        {
++            "feature_a": [0.0, 0.1, 0.2, 0.8, 0.9, 1.0] * 10,
++            "label": [0, 0, 1, 0, 1, 0] * 10,
++        }
++    )
++    matrix = xgboost.DMatrix(frame[["feature_a"]], label=frame["label"])
++    booster = xgboost.train(
++        {"objective": "binary:logistic", "max_depth": 1, "seed": 7},
++        matrix,
++        num_boost_round=2,
++    )
++    metrics, details = runtime._evaluation(
++        _PredictionDataset(frame),
++        booster,
++        feature_names=("feature_a",),
++        label_name="label",
++        task_type="BINARY_CLASSIFICATION",
++        num_class=None,
++        artifacts={"roc_curve": True, "threshold_analysis": True},
++        positive_label=positive_label,
++    )
++    probability = booster.predict(matrix)
++    if positive_label == 0:
++        probability = 1 - probability
++    labels = (frame["label"].to_numpy() == positive_label).astype(int)
++    predicted = (probability >= 0.5).astype(int)
++    tn, fp, fn, tp = expected.confusion_matrix(labels, predicted, labels=[0, 1]).ravel()
++    assert details["confusion_matrix"] == {"tn": tn, "fp": fp, "fn": fn, "tp": tp}
++    for name, value in {
++        "accuracy": expected.accuracy_score(labels, predicted),
++        "precision": expected.precision_score(labels, predicted, zero_division=0),
++        "recall": expected.recall_score(labels, predicted, zero_division=0),
++        "f1": expected.f1_score(labels, predicted, zero_division=0),
++        "auc": expected.roc_auc_score(labels, probability),
++        "average_precision": expected.average_precision_score(labels, probability),
++    }.items():
++        assert metrics[name] == pytest.approx(value)
++    thresholds = details["threshold_analysis"]["thresholds"]
++    assert details["threshold_analysis"]["predicted_positive_rows"] == [
++        int((probability >= threshold).sum()) for threshold in thresholds
++    ]
++
++
+ def test_binary_f1_uses_the_true_harmonic_mean_denominator() -> None:
+     predictions = pd.DataFrame(
+         {
+diff --git a/tests/test_xgboost_onnx_signature.py b/tests/test_xgboost_onnx_signature.py
+new file mode 100644
+index 0000000..3278ddd
+--- /dev/null
++++ b/tests/test_xgboost_onnx_signature.py
+@@ -0,0 +1,111 @@
++"""The portable model must expose the same outputs as its checkpoint contract."""
++
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import onnx
++import onnxruntime
++import pytest
++import xgboost
++from tributo.exporting.models import (
++    CheckpointField,
++    ExportCheckpointV1,
++    ExportContext,
++    ExportSource,
++)
++from tributo_algorithms_boosting.native import OfficialXGBoostONNXExporter
++
++
++@pytest.mark.parametrize(
++    "objective,data_case",
++    [
++        ("binary:logistic", "balanced"),
++        ("multi:softprob", "balanced"),
++        ("reg:squarederror", "nonzero_mean"),
++        ("binary:logistic", "constant_0.2"),
++        ("binary:logistic", "constant_0.5"),
++        ("binary:logistic", "constant_0.8"),
++        ("binary:logistic", "variable_0.2"),
++        ("binary:logistic", "variable_0.8"),
++        ("multi:softprob", "constant_imbalanced"),
++        ("multi:softprob", "variable_imbalanced"),
++        ("reg:squarederror", "constant_nonzero_mean"),
++    ],
++)
++def test_exported_graph_matches_checkpoint_names_and_native_values(
++    tmp_path: Path, objective: str, data_case: str
++) -> None:
++    classification = objective != "reg:squarederror"
++    multi = objective == "multi:softprob"
++    features = np.asarray([[i / 7, i % 3] for i in range(30)], dtype=np.float32)
++    labels = (
++        np.arange(30) % (3 if multi else 2) if classification else np.arange(30) / 9 - 2
++    )
++    if data_case.startswith("constant_"):
++        features = np.zeros((30, 2), dtype=np.float32)
++    if objective == "binary:logistic" and data_case != "balanced":
++        positive_fraction = float(data_case.split("_")[-1])
++        labels = np.asarray(
++            [1] * int(30 * positive_fraction)
++            + [0] * (30 - int(30 * positive_fraction))
++        )
++    elif multi and data_case.endswith("imbalanced"):
++        labels = np.asarray([0] * 3 + [1] * 9 + [2] * 18)
++    matrix = xgboost.DMatrix(features, label=labels, feature_names=["f0", "f1"])
++    parameters = {"objective": objective, "max_depth": 2, "nthread": 1}
++    if multi:
++        parameters["num_class"] = 3
++    booster = xgboost.train(parameters, matrix, num_boost_round=3)
++    output_schema = (
++        (
++            CheckpointField(name="label", dtype="int64", shape=("batch",)),
++            CheckpointField(
++                name="probabilities",
++                dtype="float32",
++                shape=("batch", 3 if multi else 2),
++            ),
++        )
++        if classification
++        else (CheckpointField(name="prediction", dtype="float32", shape=("batch", 1)),)
++    )
++    contract = ExportCheckpointV1(
++        trainer_type="xgboost",
++        architecture_id="xgboost",
++        input_schema=(
++            CheckpointField(name="float_input", dtype="float32", shape=("batch", 2)),
++        ),
++        output_schema=output_schema,
++        preprocessing={"type": "none"},
++        task_type="classification" if classification else "regression",
++        framework="xgboost",
++        framework_version=xgboost.__version__,
++        checkpoint_format_version=1,
++    )
++    source = ExportSource(
++        source_kind="xgboost_result",
++        model_object=booster,
++        feature_schema={"feature_names": ["f0", "f1"]},
++        checkpoint_contract=contract,
++    )
++    draft = OfficialXGBoostONNXExporter().export(
++        ExportContext(execution_id="test", node_id="onnx", artifact_dir=tmp_path),
++        source,
++        {},
++        SimpleNamespace(typed_options={}, target=SimpleNamespace(name="onnx")),
++    )
++    path = tmp_path / draft.entrypoint
++    onnx.checker.check_model(onnx.load(path))
++    options = onnxruntime.SessionOptions()
++    options.intra_op_num_threads = 1
++    options.inter_op_num_threads = 1
++    session = onnxruntime.InferenceSession(str(path), sess_options=options)
++    assert tuple(item.name for item in session.get_outputs()) == tuple(
++        field.name for field in contract.output_schema
++    )
++    values = session.run(None, {"float_input": features})
++    native = booster.predict(matrix)
++    actual = (
++        values[1] if multi else values[1][:, 1] if classification else values[0][:, 0]
++    )
++    np.testing.assert_allclose(actual, native, atol=1e-6, rtol=1e-6)
+diff --git a/tests/test_xgboost_worker_shards.py b/tests/test_xgboost_worker_shards.py
+new file mode 100644
+index 0000000..27f56e7
+--- /dev/null
++++ b/tests/test_xgboost_worker_shards.py
+@@ -0,0 +1,159 @@
++"""Real Ray regressions for sparse blocks and lossless training shards.
++
++Run directly against an existing local cluster with RAY_ADDRESS=auto, or let
++pytest start an isolated local Ray runtime. Only the connection is shut down
++when using an existing cluster.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import tempfile
++import unittest
++from typing import Any
++
++import pyarrow as pa
++import ray
++from ray.train import RunConfig, ScalingConfig
++from ray.train.xgboost import XGBoostTrainer
++from tributo_algorithms_boosting import training as runtime
++from tributo_algorithms_boosting.data_config import CompleteCoverageDataConfig
++
++
++def _sparse_dataset(rows: int, blocks: int = 200) -> Any:
++    table = pa.table(
++        {
++            "id": list(range(rows)),
++            "feature": [float(index % 7) for index in range(rows)],
++            "label": [index % 2 for index in range(rows)],
++        }
++    )
++    return ray.data.from_arrow([table, *[table.slice(0, 0)] * (blocks - 1)])
++
++
++def _collect_shard(shard: Any) -> list[int]:
++    return [
++        int(value)
++        for batch in shard.iter_batches(batch_format="numpy", batch_size=64)
++        for value in batch["id"]
++    ]
++
++
++def _worker_ids(dataset: Any, workers: int) -> list[list[int]]:
++    shards = CompleteCoverageDataConfig(datasets_to_split=["train"]).configure(
++        {"train": dataset}, workers, None, None
++    )
++    collect = ray.remote(num_cpus=0)(_collect_shard)
++    return ray.get(
++        [collect.remote(shard["train"]) for shard in shards], timeout=120
++    )
++
++
++class TestWorkerShardCoverage(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls) -> None:
++        if os.environ.get("RAY_ADDRESS"):
++            ray.init(address=os.environ["RAY_ADDRESS"])
++        else:
++            ray.init(num_cpus=4, include_dashboard=False, object_store_memory=134217728)
++        ray.data.DataContext.get_current().enable_progress_bars = False
++
++    @classmethod
++    def tearDownClass(cls) -> None:
++        ray.shutdown()
++
++    def _assert_shards(
++        self, dataset: Any, rows: int, workers: int, name: str = "train"
++    ) -> list[list[int]]:
++        prepared = runtime._ensure_worker_blocks(
++            dataset, worker_count=workers, row_count=rows, name=name
++        ).materialize()
++        shards = _worker_ids(prepared, workers)
++        self.assertTrue(all(shards), [len(shard) for shard in shards])
++        self.assertEqual(sum(map(len, shards)), rows)
++        self.assertEqual(len({value for shard in shards for value in shard}), rows)
++        self.assertLessEqual(max(map(len, shards)) - min(map(len, shards)), 1)
++        return shards
++
++    def test_sparse_three_way_split_preserves_all_rows(self) -> None:
++        train, validation, test, rows = runtime._split_dataset(
++            _sparse_dataset(834),
++            {
++                "train_ratio": 0.65,
++                "validation_ratio": 0.15,
++                "test_ratio": 0.20,
++                "split_strategy": "RANDOM",
++                "seed": 42,
++            },
++        )
++        all_ids: list[int] = []
++        counts = {}
++        for name, dataset in (("train", train), ("validation", validation), ("test", test)):
++            shards = self._assert_shards(dataset, rows[name], 2, name)
++            counts[name] = list(map(len, shards))
++            all_ids.extend(value for shard in shards for value in shard)
++        self.assertEqual(sorted(all_ids), list(range(834)))
++        print(json.dumps({"case": "sparse_three_way", "rows": rows, "shards": counts}))
++
++    def test_odd_rows_and_existing_worker_block_count(self) -> None:
++        shards = self._assert_shards(_sparse_dataset(835, blocks=2), 835, 2)
++        self.assertEqual(sorted(value for shard in shards for value in shard), list(range(835)))
++        print(json.dumps({"case": "odd_rows", "shards": list(map(len, shards))}))
++
++    def test_minimum_rows_and_too_few_rows(self) -> None:
++        shards = self._assert_shards(_sparse_dataset(4), 4, 4)
++        self.assertEqual(list(map(len, shards)), [1, 1, 1, 1])
++        for rows in (0, 1, 3):
++            with self.assertRaisesRegex(ValueError, "fewer rows than XGBoost workers"):
++                runtime._ensure_worker_blocks(
++                    _sparse_dataset(rows), worker_count=4, row_count=rows, name="validation"
++                )
++        print(json.dumps({"case": "minimum_rows", "shards": list(map(len, shards))}))
++
++    def test_xgboost_two_workers_receive_train_and_validation(self) -> None:
++        datasets = {
++            name: runtime._ensure_worker_blocks(
++                _sparse_dataset(rows), worker_count=2, row_count=rows, name=name
++            )
++            for name, rows in (("train", 543), ("validation", 125))
++        }
++        evidence = ray.remote(runtime._EvidenceCollector).options(num_cpus=0).remote()
++        try:
++            with tempfile.TemporaryDirectory(
++                prefix="tributo-shard-regression-",
++                dir=os.environ.get("TRIBUTO_TEST_SHARED_STORAGE"),
++            ) as root:
++                trainer = XGBoostTrainer(
++                    train_loop_per_worker=runtime._xgboost_train_loop,
++                    train_loop_config={
++                        "feature_names": ["feature"],
++                        "label_name": "label",
++                        "params": {"objective": "binary:logistic", "eval_metric": "logloss"},
++                        "num_rounds": 3,
++                        "batch_rows": 64,
++                        "evidence_actor": evidence,
++                    },
++                    scaling_config=ScalingConfig(num_workers=2, resources_per_worker={"CPU": 1}),
++                    datasets=datasets,
++                    dataset_config=CompleteCoverageDataConfig(datasets_to_split="all"),
++                    run_config=RunConfig(storage_path=root, name="empty-block-regression"),
++                )
++                result = trainer.fit()
++                self.assertIsNotNone(result.checkpoint)
++            records = ray.get(evidence.snapshot.remote())
++            self.assertEqual(len(records), 2)
++            self.assertEqual(sum(item["input_rows"]["train"] for item in records), 543)
++            self.assertEqual(sum(item["input_rows"]["validation"] for item in records), 125)
++            for record in records:
++                self.assertGreater(record["input_rows"]["train"], 0)
++                self.assertGreater(record["input_rows"]["validation"], 0)
++                self.assertEqual(record["collective_steps"], 3)
++            self.assertEqual(len({item["model_state_digest"] for item in records}), 1)
++            print(json.dumps({"case": "xgboost_two_workers", "input_rows": [item["input_rows"] for item in records]}))
++        finally:
++            ray.kill(evidence)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)

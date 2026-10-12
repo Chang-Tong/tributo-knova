@@ -1,0 +1,482 @@
+{
+  "scope": "mapping, synthetic execution, isolated Redis; no business database or Ray jobs",
+  "summary": {
+    "PASS": 9,
+    "FAIL": 30
+  },
+  "results": [
+    {
+      "id": "compatible_minor",
+      "category": "contract",
+      "expected": "accept 2.9 and unknown field",
+      "status": "PASS",
+      "actual": "2.9"
+    },
+    {
+      "id": "missing_version",
+      "category": "contract",
+      "expected": "UNSUPPORTED_PROTOCOL_VERSION",
+      "status": "PASS",
+      "actual": {
+        "rejected": true,
+        "code": "UNSUPPORTED_PROTOCOL_VERSION",
+        "exception": "KnovaProtocolFailure",
+        "message": "protocol_version is required"
+      }
+    },
+    {
+      "id": "baseline_training_plan",
+      "category": "contract",
+      "expected": "supported numeric single-table plan",
+      "status": "PASS",
+      "actual": "xgboost"
+    },
+    {
+      "id": "baseline_inference_plan",
+      "category": "contract",
+      "expected": "protocol model_weights+ONNX accepted",
+      "status": "PASS",
+      "actual": "artifact"
+    },
+    {
+      "id": "classification_stratify",
+      "category": "capability",
+      "expected": "valid stratified classification accepted",
+      "status": "FAIL",
+      "actual": {
+        "rejected": true,
+        "code": null,
+        "exception": "_TrainingConfigurationError",
+        "message": "data_split.stratify=true is not supported by this runtime"
+      }
+    },
+    {
+      "id": "duplicate_feature_id",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "duplicate_result_column",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "undeclared_origin",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "no_primary_table",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "category_mismatch",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "missing_entity_column",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "invalid_sampling_ratio",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "invalid_tuning_mode",
+      "category": "contract",
+      "expected": "reject invalid payload before execution",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "training_controls",
+      "category": "contract",
+      "expected": "timeout and protocol patience reach execution plan",
+      "status": "FAIL",
+      "actual": {
+        "num_rounds": 5,
+        "train_ratio": 0.7,
+        "validation_ratio": 0.1,
+        "test_ratio": 0.2,
+        "seed": 42,
+        "split_strategy": "RANDOM",
+        "stratify": false,
+        "positive_label": 1
+      }
+    },
+    {
+      "id": "extension_tolerance",
+      "category": "contract",
+      "expected": "arbitrary extension content does not reject task",
+      "status": "FAIL",
+      "actual": {
+        "rejected": true,
+        "code": null,
+        "exception": "_TrainingConfigurationError",
+        "message": "extensions.tributo must be an object"
+      }
+    },
+    {
+      "id": "typed_sql_parameter",
+      "category": "contract",
+      "expected": "Int64 parameter remains integer 42",
+      "status": "FAIL",
+      "actual": {
+        "value": "42",
+        "type": "str"
+      }
+    },
+    {
+      "id": "required_query",
+      "category": "contract",
+      "expected": "reject missing authoritative SQL",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "sql_projection_semantics",
+      "category": "contract",
+      "expected": "preserve expression or reject unsupported SQL",
+      "status": "FAIL",
+      "actual": {
+        "columns": [
+          "x",
+          "z"
+        ],
+        "transforms": {
+          "version": 1,
+          "steps": []
+        }
+      }
+    },
+    {
+      "id": "artifact_feature_order",
+      "category": "contract",
+      "expected": "reordering declarations must not silently permute the model tensor",
+      "status": "FAIL",
+      "actual": {
+        "original": [
+          [
+            1.0,
+            10.0
+          ]
+        ],
+        "permuted_feature_declarations": [
+          [
+            10.0,
+            1.0
+          ]
+        ]
+      }
+    },
+    {
+      "id": "missing_file_hash",
+      "category": "contract",
+      "expected": "reject invalid/unsupported mandatory artifact",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "missing_prefix_slash",
+      "category": "contract",
+      "expected": "reject invalid/unsupported mandatory artifact",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "unknown_artifact_key",
+      "category": "contract",
+      "expected": "reject invalid/unsupported mandatory artifact",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "required_preprocessor",
+      "category": "contract",
+      "expected": "reject invalid/unsupported mandatory artifact",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "duplicate_alternative",
+      "category": "contract",
+      "expected": "reject invalid/unsupported mandatory artifact",
+      "status": "FAIL",
+      "actual": {
+        "rejected": false
+      }
+    },
+    {
+      "id": "credential_ref_precedence",
+      "category": "contract",
+      "expected": "credential_ref wins over inline fixture",
+      "status": "FAIL",
+      "actual": "inline-fixture"
+    },
+    {
+      "id": "decimal_json_safety",
+      "category": "contract",
+      "expected": "Decimal feature serializes to native JSON number",
+      "status": "FAIL",
+      "actual": {
+        "exception": "TypeError",
+        "message": "Object of type Decimal is not JSON serializable"
+      }
+    },
+    {
+      "id": "training_invalid_error_code",
+      "category": "contract",
+      "expected": "INVALID_PAYLOAD",
+      "status": "FAIL",
+      "actual": "EXECUTION_FAILED"
+    },
+    {
+      "id": "inference_started",
+      "category": "contract",
+      "expected": "STARTED with measured total_rows",
+      "status": "FAIL",
+      "actual": {
+        "protocol_version": "2.0",
+        "event_type": "LOG",
+        "execution_id": "audit-infer",
+        "timestamp": 1790696987574,
+        "phase": "INIT",
+        "level": "info",
+        "message": ""
+      }
+    },
+    {
+      "id": "queued_cancel_phase",
+      "category": "contract",
+      "expected": "inference phase uses valid INIT enum",
+      "status": "FAIL",
+      "actual": {
+        "protocol_version": "2.0",
+        "event_type": "CANCELLED",
+        "execution_id": "audit-infer",
+        "timestamp": 1790696987574,
+        "phase": "QUEUED",
+        "processed_rows": 0,
+        "result_rows": 0,
+        "total_rows": 0,
+        "percent": 0.0,
+        "stop_reason": "CANCELLED",
+        "message": "",
+        "duration_seconds": 0.0
+      }
+    },
+    {
+      "id": "inference_final_progress",
+      "category": "contract",
+      "expected": "explicit final PROGRESS=100 and STARTED",
+      "status": "FAIL",
+      "actual": [
+        {
+          "event_type": "PROGRESS",
+          "execution_id": "audit-infer",
+          "percent": 0.0,
+          "phase": "INIT",
+          "processed_rows": 0,
+          "protocol_version": "2.0",
+          "result_rows": 0,
+          "timestamp": 1790696987574,
+          "total_rows": 0
+        },
+        {
+          "event_type": "PROGRESS",
+          "execution_id": "audit-infer",
+          "percent": 0.0,
+          "phase": "PREDICT",
+          "processed_rows": 0,
+          "protocol_version": "2.0",
+          "result_rows": 0,
+          "timestamp": 1790696987580,
+          "total_rows": 20
+        },
+        {
+          "duration_seconds": 0.006,
+          "event_type": "COMPLETED",
+          "execution_id": "audit-infer",
+          "message": "",
+          "percent": 100.0,
+          "phase": "CLEANUP",
+          "processed_rows": 20,
+          "protocol_version": "2.0",
+          "result_rows": 20,
+          "timestamp": 1790696987580,
+          "total_rows": 20
+        }
+      ]
+    },
+    {
+      "id": "inference_timeout",
+      "category": "contract",
+      "expected": "elapsed 10s with limit 1s must fail EXECUTION_TIMEOUT",
+      "status": "FAIL",
+      "actual": {
+        "duration_seconds": 10.0,
+        "event_type": "COMPLETED",
+        "execution_id": "audit-infer",
+        "message": "",
+        "percent": 100.0,
+        "phase": "CLEANUP",
+        "processed_rows": 20,
+        "protocol_version": "2.0",
+        "result_rows": 20,
+        "timestamp": 1790696987581,
+        "total_rows": 20
+      }
+    },
+    {
+      "id": "redis_terminal_exclusion",
+      "category": "contract",
+      "expected": "24 concurrent terminal writes + late LOG produce one entry",
+      "status": "PASS",
+      "actual": 1
+    },
+    {
+      "id": "redis_event_maxlen",
+      "category": "contract",
+      "expected": "MAXLEN=5 enforced",
+      "status": "PASS",
+      "actual": 5
+    },
+    {
+      "id": "redis_incompatible_version_ack",
+      "category": "contract",
+      "expected": "FAILED UNSUPPORTED_PROTOCOL_VERSION and ACK",
+      "status": "PASS",
+      "actual": {
+        "event": {
+          "duration_seconds": 0.0,
+          "error_code": "UNSUPPORTED_PROTOCOL_VERSION",
+          "error_message": "request schema validation failed",
+          "event_type": "FAILED",
+          "job_id": "badversion",
+          "phase": "QUEUED",
+          "protocol_version": "2.0",
+          "timestamp": 1790696987621
+        },
+        "pending": 0
+      }
+    },
+    {
+      "id": "redis_empty_cancel_value",
+      "category": "contract",
+      "expected": "existing empty cancel marker gives CANCELLED+ACK",
+      "status": "PASS",
+      "actual": {
+        "event": {
+          "duration_seconds": 0.0,
+          "event_type": "CANCELLED",
+          "has_best_model": false,
+          "job_id": "precancel",
+          "phase": "QUEUED",
+          "protocol_version": "2.0",
+          "timestamp": 1790696987621
+        },
+        "pending": 0
+      }
+    },
+    {
+      "id": "cancel_before_schema_validation",
+      "category": "contract",
+      "expected": "queued cancellation wins before malformed payload validation",
+      "status": "FAIL",
+      "actual": {
+        "event": {
+          "duration_seconds": 0.0,
+          "error_code": "INVALID_JSON",
+          "error_message": "payload is not valid JSON",
+          "event_type": "FAILED",
+          "job_id": "cancelbad",
+          "phase": "QUEUED",
+          "protocol_version": "2.0",
+          "timestamp": 1790696987622
+        },
+        "pending": 0
+      }
+    },
+    {
+      "id": "redis_pending_recovery",
+      "category": "contract",
+      "expected": "XAUTOCLAIM recovers staged pending delivery",
+      "status": "PASS",
+      "actual": 1
+    },
+    {
+      "id": "cancel_progress_snapshot",
+      "category": "contract",
+      "expected": "CANCELLED preserves 8 processed / 4 written / 10 total and WRITE_RESULT",
+      "status": "FAIL",
+      "actual": {
+        "duration_seconds": 0.0,
+        "event_type": "CANCELLED",
+        "execution_id": "cancel-snapshot",
+        "message": "",
+        "percent": 0.0,
+        "phase": "PREDICT",
+        "processed_rows": 0,
+        "protocol_version": "2.0",
+        "result_rows": 0,
+        "stop_reason": "CANCELLED",
+        "timestamp": 1790696987635,
+        "total_rows": 0
+      }
+    },
+    {
+      "id": "invalid_utf8_contained",
+      "category": "contract",
+      "expected": "invalid UTF-8 must not escape the consume loop",
+      "status": "FAIL",
+      "actual": {
+        "exception": "UnicodeDecodeError",
+        "message": "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"
+      }
+    }
+  ]
+}

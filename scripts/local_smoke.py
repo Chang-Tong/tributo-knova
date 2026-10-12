@@ -286,7 +286,7 @@ def _training_request(
     storage_context = {
         "type": args.storage_mode,
         "bucket": storage_root if args.storage_mode == "nfs" else args.s3_bucket,
-        "prefix": storage_prefix,
+        "prefix": storage_prefix.rstrip("/") + "/",
         "properties": (
             {} if args.storage_mode == "nfs" else {"ray_storage_path": storage_root}
         ),
@@ -298,6 +298,7 @@ def _training_request(
         "version_id": "v1",
         "tenant_id": "local-smoke",
         "algorithm": {
+            "category": "CLASSIFICATION",
             "algorithm_key": "xgboost",
             "hyper_params": {"n_estimators": 3, "max_depth": 3},
         },
@@ -310,12 +311,46 @@ def _training_request(
             "password": password,
             "properties": {"native_table": f"knova.{table}"},
         },
+        "tables": [
+            {
+                "table_alias": "t0",
+                "database_name": "knova",
+                "table_name": table,
+                "role": "PRIMARY",
+            }
+        ],
+        "data_query": {
+            "mode": "DIRECT_QUERY",
+            "query": {
+                "sql": (
+                    "SELECT t0.f1 AS t0__f1, t0.f2 AS t0__f2, "
+                    f"t0.label AS t0__label FROM knova.{table} t0"
+                ),
+                "params": {},
+            },
+        },
         "features": [
-            {"origin": {"column_name": "f1"}},
-            {"origin": {"column_name": "f2"}},
+            {
+                "feature_id": f"f{i}",
+                "display_name": f"Feature {i}",
+                "feature_role": "REGULAR",
+                "origin": {
+                    "table_alias": "t0",
+                    "column_name": f"f{i}",
+                    "column_type": "Float32",
+                },
+                "result_column": f"t0__f{i}",
+            }
+            for i in (1, 2)
         ],
         "target": {
-            "origin": {"column_name": "label"},
+            "display_name": "Label",
+            "result_column": "t0__label",
+            "origin": {
+                "table_alias": "t0",
+                "column_name": "label",
+                "column_type": "UInt8",
+            },
             "task_type": "BINARY_CLASSIFICATION",
             "label_mapping": {"active": 0, "churn": 1},
         },
@@ -346,6 +381,7 @@ def _inference_request(
         "model": {
             "model_id": "local-xgboost",
             "version_id": "v1",
+            "algorithm_category": "CLASSIFICATION",
             "algorithm_key": "xgboost",
             "task_type": "BINARY_CLASSIFICATION",
             "label_mapping": {"active": 0, "churn": 1},
@@ -372,23 +408,42 @@ def _inference_request(
                 }
             ],
             "entity_key": {
-                "origin": {"table_alias": "t0", "column_name": "entity_id"},
+                "origin": {
+                    "table_alias": "t0",
+                    "column_name": "entity_id",
+                    "column_type": "UInt64",
+                },
                 "result_column": "entity_id",
             },
             "query": {
                 "sql": (
-                    f"SELECT * FROM knova.{input_table} t0 "
+                    "SELECT t0.entity_id AS entity_id, t0.f1 AS t0__f1, "
+                    f"t0.f2 AS t0__f2 FROM knova.{input_table} t0 "
                     "WHERE t0.stat_month = {month:String}"
                 ),
                 "params": {"month": "202601"},
             },
             "features": [
                 {
-                    "origin": {"table_alias": "t0", "column_name": "f1"},
+                    "feature_id": "f1",
+                    "display_name": "Feature 1",
+                    "feature_role": "REGULAR",
+                    "origin": {
+                        "table_alias": "t0",
+                        "column_name": "f1",
+                        "column_type": "Float32",
+                    },
                     "result_column": "t0__f1",
                 },
                 {
-                    "origin": {"table_alias": "t0", "column_name": "f2"},
+                    "feature_id": "f2",
+                    "display_name": "Feature 2",
+                    "feature_role": "REGULAR",
+                    "origin": {
+                        "table_alias": "t0",
+                        "column_name": "f2",
+                        "column_type": "Float32",
+                    },
                     "result_column": "t0__f2",
                 },
             ],
@@ -633,7 +688,7 @@ def main() -> int:
             "pred_probability Nullable(Float64), "
             "pred_probabilities Nullable(String), pred_value Nullable(Float64), "
             "pred_extra String, execution_id String, model_id String, "
-            "version_id String, tenant_id String, inferred_at DateTime64(6, 'UTC')) "
+            "version_id String, tenant_id String, inferred_at DateTime64(6)) "
             "ENGINE=MergeTree ORDER BY (execution_id, entity_id)"
         )
 
@@ -667,9 +722,7 @@ def main() -> int:
         sample_rows = training_terminal["result_summary"]["sample_rows"]
         if (
             sample_rows["total"] != 300
-            or sample_rows["train"]
-            + sample_rows["validation"]
-            + sample_rows["test"]
+            or sample_rows["train"] + sample_rows["validation"] + sample_rows["test"]
             != sample_rows["total"]
             or sample_rows["validation"] <= 0
             or sample_rows["test"] <= 0
@@ -677,9 +730,9 @@ def main() -> int:
             raise RuntimeError("training terminal event has an invalid row count")
         formats = {
             alternative["format"]
-            for alternative in artifact_manifest["model_artifacts"][
-                "model_weights"
-            ]["alternatives"]
+            for alternative in artifact_manifest["model_artifacts"]["model_weights"][
+                "alternatives"
+            ]
         }
         if formats != {"onnx", "xgboost"}:
             raise RuntimeError("training artifact manifest is incomplete")

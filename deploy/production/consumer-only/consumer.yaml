@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tributo-knova-consumer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tributo-knova-consumer
+  template:
+    metadata:
+      labels:
+        app: tributo-knova-consumer
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: consumer
+          image: knova-tributo-devbox:v2.7
+          imagePullPolicy: IfNotPresent
+          command: ["tributo-knova"]
+          args: ["consume", "--config", "/etc/tributo-knova/config.json"]
+          envFrom:
+            - secretRef:
+                name: tributo-knova-env
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: RAY_USAGE_STATS_ENABLED
+              value: "0"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            exec:
+              command: ["tributo-knova", "health", "--config", "/etc/tributo-knova/config.json"]
+            periodSeconds: 20
+            timeoutSeconds: 15
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tributo-knova
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: tributo-knova-config

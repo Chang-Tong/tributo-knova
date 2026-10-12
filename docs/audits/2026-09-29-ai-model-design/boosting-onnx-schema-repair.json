@@ -1,0 +1,8 @@
+{
+  "wheel_sha256": "c8bbed6fd0c9f828b37de498113f578f93c4ccb2ba5811ff80ee8f4424d4e922",
+  "onnx_exporter_sha256": "6566f6d609e58e7fca238087c009271c021b1f1c5481df80ba8f3c0e47ee135e",
+  "incremental_patch_replay_matches_wheel": true,
+  "patch": "vendor/patches/boosting-v2.8-onnx-schema.patch",
+  "verification_test": "tests/test_boosting_wheel_metadata.py",
+  "real_model_export_cases": 11
+}

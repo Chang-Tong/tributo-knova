@@ -1,0 +1,82 @@
+diff --git a/packages/boosting/src/tributo_algorithms_boosting/native.py b/packages/boosting/src/tributo_algorithms_boosting/native.py
+--- a/packages/boosting/src/tributo_algorithms_boosting/native.py
++++ b/packages/boosting/src/tributo_algorithms_boosting/native.py
+@@ -209,6 +209,36 @@
+                             )
+                         )
+                     output.name = field.name
++        # Keep the fitted matrix contract inside the integrity-checked model.
++        # Request feature arrays describe data acquisition, not model order.
++        # Preserve converter metadata while recording only trusted model facts.
++        from onnx import helper
++
++        if (
++            len(feature_names) != int(booster.num_features())
++            or len(set(feature_names)) != len(feature_names)
++            or any(not name for name in feature_names)
++        ):
++            raise ValueError("XGBoost feature schema does not match the model")
++        objective = str(configuration["objective"]["name"])
++        task_type = (
++            "BINARY_CLASSIFICATION" if objective.startswith("binary:")
++            else "MULTICLASS_CLASSIFICATION" if objective.startswith("multi:")
++            else "REGRESSION"
++        )
++        metadata = {item.key: item.value for item in converted.metadata_props}
++        metadata.update(
++            feature_names=json.dumps(feature_names, ensure_ascii=False),
++            task_type=task_type,
++            objective=objective,
++            framework="xgboost",
++            num_features=str(booster.num_features()),
++        )
++        if objective.startswith(("binary:", "multi:")):
++            metadata["num_classes"] = str(
++                max(2, int(configuration["learner_model_param"]["num_class"]))
++            )
++        helper.set_model_props(converted, metadata)
+         converted.graph.name = "tributo-official-xgboost"
+         path = context.artifact_dir / "model.onnx"
+         path.write_bytes(converted.SerializeToString())
+diff --git a/tests/test_xgboost_onnx_signature.py b/tests/test_xgboost_onnx_signature.py
+--- a/tests/test_xgboost_onnx_signature.py
++++ b/tests/test_xgboost_onnx_signature.py
+@@ -2,6 +2,8 @@
+ 
+ from pathlib import Path
+ from types import SimpleNamespace
++
++import json
+ 
+ import numpy as np
+ import onnx
+@@ -85,7 +87,7 @@
+     source = ExportSource(
+         source_kind="xgboost_result",
+         model_object=booster,
+-        feature_schema={"feature_names": ["f0", "f1"]},
++        feature_schema={"feature_names": ["opaque_spend", "opaque_age"]},
+         checkpoint_contract=contract,
+     )
+     draft = OfficialXGBoostONNXExporter().export(
+@@ -95,7 +97,19 @@
+         SimpleNamespace(typed_options={}, target=SimpleNamespace(name="onnx")),
+     )
+     path = tmp_path / draft.entrypoint
+-    onnx.checker.check_model(onnx.load(path))
++    graph = onnx.load(path)
++    onnx.checker.check_model(graph)
++    metadata = {item.key: item.value for item in graph.metadata_props}
++    assert json.loads(metadata["feature_names"]) == ["opaque_spend", "opaque_age"]
++    assert metadata["task_type"] == (
++        "MULTICLASS_CLASSIFICATION" if multi else
++        "BINARY_CLASSIFICATION" if classification else "REGRESSION"
++    )
++    assert metadata["objective"] == objective
++    assert metadata["framework"] == "xgboost"
++    assert metadata["num_features"] == "2"
++    if classification:
++        assert metadata["num_classes"] == ("3" if multi else "2")
+     options = onnxruntime.SessionOptions()
+     options.intra_op_num_threads = 1
+     options.inter_op_num_threads = 1

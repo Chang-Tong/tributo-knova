@@ -1,5 +1,5 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
 image="${1:-tributo-knova:local}"
 output="${2:-dist/tributo-knova.tar.zst}"

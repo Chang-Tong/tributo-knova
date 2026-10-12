@@ -1,0 +1,12 @@
+# Redis master password used by both the Consumer and the Ray Job driver.
+KNOVA_REDIS_PASSWORD=
+
+# Set and reference this variable only when Sentinel itself requires auth.
+KNOVA_REDIS_SENTINEL_PASSWORD=
+
+# S3-compatible model and checkpoint storage.
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_ENDPOINT_URL=
+AWS_REGION=
+AWS_EC2_METADATA_DISABLED=true

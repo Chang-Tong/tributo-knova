@@ -8,17 +8,14 @@ dependencies = [
     "boto3>=1.42.91",
     "clickhouse-connect>=1.5,<1.6",
     "pydantic>=2.0,<3.0",
-    "ray-clickhouse @ git+https://github.com/jiangxt2/ray-clickhouse.git@418f6c9608b61228986e6d247e604f36856307ba",
-    "tributo @ git+https://github.com/jiangxt2/Tributo.git@8cf821a22267e4972075d576eedacf3735f3d330",
-    "tributo-algorithms-boosting @ git+https://github.com/jiangxt2/tributo-algorithms.git@71a6a16c3fd3676aba2225a0c528817634927fc7#subdirectory=packages/boosting",
-    "tributo-broker-redis @ git+https://github.com/Chang-Tong/tributo-broker-redis.git@41a193b7b9215e332d82b67abf72315e99d18b45",
+    "ray-clickhouse @ git+https://github.com/Chang-Tong/ray-clickhouse-upstream.git@c1627101736463ccc94c99c6793f91360173e6ac",
+    "tributo @ git+https://github.com/Chang-Tong/Tributo.git@440da0422a3a9c5b041b6ecdbb2e40c00bf43cd90",
+    "tributo-algorithms-boosting @ git+https://github.com/Chang-Tong/tributo-algorithms.git@6f39378d4d850cfd41e9510abc313efc6d4f209f#subdirectory=packages/boosting",
+    "tributo-broker-redis @ git+https://github.com/Chang-Tong/tributo-broker-redis.git@e2973b2a7409fc72807bbec23388d13966c5c319",
 ]
 
 [project.entry-points."tributo.brokers"]
 tributo-knova = "tributo_knova.broker:KnovaBrokerPlugin"
-
-[project.entry-points."tributo.ingestion_bindings"]
-tributo-knova-clickhouse = "tributo_knova.clickhouse:clickhouse_binding_descriptor"
 
 [project.scripts]
 tributo-knova = "tributo_knova.cli:main"
@@ -41,7 +38,7 @@ allow-direct-references = true
 
 [tool.uv]
 override-dependencies = [
-    "tributo[model-export] @ git+https://github.com/jiangxt2/Tributo.git@8cf821a22267e4972075d576eedacf3735f3d330",
+    "tributo[model-export] @ git+https://github.com/Chang-Tong/Tributo.git@440da0422a3a9c5b041b6ecdbb2e40c00bf43cd90",
 ]
 
 [tool.pytest.ini_options]

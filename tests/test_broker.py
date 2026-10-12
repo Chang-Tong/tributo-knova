@@ -1,5 +1,6 @@
 import base64
 import json
+import runpy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +24,11 @@ from tributo_knova.broker import (
     prepare_broker_operation,
 )
 from tributo_knova.reporter import KnovaRedisEventReporter
+
+
+def _protocol_payload(kind: str = "training") -> dict[str, Any]:
+    make = runpy.run_path(Path(__file__).with_name(f"test_{kind}.py"))["_request"]
+    return make().model_dump(mode="json")
 
 
 class _FakeRedis:
@@ -71,6 +77,59 @@ class _FakeRedis:
         pass
 
 
+@pytest.mark.parametrize("event_type", ["COMPLETED", "FAILED", "CANCELLED"])
+def test_watcher_recognizes_knova_v2_terminal_without_submission_id(
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    config = _broker_config(tmp_path)
+    redis = _FakeRedis("")
+    item = ActiveSubmission(
+        operation_id="job-terminal",
+        operation_type="training",
+        execution_profile="distributed",
+        run_id="job-terminal",
+        channel=config.channels.training,
+        submission=RayJobSubmission(
+            run_id="job-terminal",
+            attempt_id="attempt-1",
+            submission_id="submission-terminal",
+        ),
+    )
+    active = ActiveSubmissionMap()
+    active.put(item)
+    redis.xadd(
+        item.channel.event_stream_key(item.operation_id),
+        {
+            "job_id": item.operation_id,
+            "payload": json.dumps(
+                {
+                    "protocol_version": "2.0",
+                    "job_id": item.operation_id,
+                    "event_type": event_type,
+                }
+            ),
+        },
+    )
+
+    def unexpected_status(*args: Any, **kwargs: Any) -> str:
+        pytest.fail("A terminal KnoVa operation must not query Ray or emit FAILED")
+
+    watcher = CancelWatcher(
+        redis,
+        active,
+        dashboard_url="http://ray:8265",
+        interval_seconds=1,
+        max_event_bytes=4096,
+        max_stream_length=100,
+        status_getter=unexpected_status,
+        reporter_factory=KnovaRedisEventReporter,
+    )
+    watcher.check_once()
+    assert active.snapshot() == ()
+    assert len(redis.events) == 1
+
+
 def _broker_config(core_root: Path) -> RedisBrokerConfig:
     return RedisBrokerConfig.model_validate(
         {
@@ -104,15 +163,7 @@ def _broker_config(core_root: Path) -> RedisBrokerConfig:
 
 
 def test_training_request_adapts_to_existing_broker_contract() -> None:
-    payload = {
-        "protocol_version": "2.0",
-        "job_id": "job-1",
-        "model_id": "model-1",
-        "version_id": "version-1",
-        "tenant_id": "tenant-1",
-        "algorithm": {"algorithm_key": "xgboost"},
-        "datasource": {"type": "CLICKHOUSE", "password": "runtime-secret"},
-    }
+    payload = _protocol_payload()
 
     request = parse_broker_request(
         json.dumps(payload),
@@ -128,18 +179,15 @@ def test_training_request_adapts_to_existing_broker_contract() -> None:
     assert request.request_digest is not None
     assert len(request.request_digest) == 64
     assert prepared.operation_payload["knova_request"]["job_id"] == "job-1"
-    assert prepared.operation_payload["knova_request"]["datasource"] == payload[
-        "datasource"
-    ]
+    assert (
+        prepared.operation_payload["knova_request"]["datasource"]
+        == payload["datasource"]
+    )
 
 
 def test_request_digest_ignores_json_formatting() -> None:
-    payload = {
-        "protocol_version": "2.0",
-        "execution_id": "inference-1",
-        "task_id": "task-1",
-        "tenant_id": "tenant-1",
-    }
+    payload = _protocol_payload("inference")
+    payload["execution_id"] = "inference-1"
 
     compact = parse_broker_request(
         json.dumps(payload, separators=(",", ":")),
@@ -174,16 +222,9 @@ def test_prepare_rejects_non_knova_generic_request() -> None:
 def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
     core_root = tmp_path / "core"
     (core_root / "src" / "tributo").mkdir(parents=True)
-    payload = json.dumps(
-        {
-            "protocol_version": "2.0",
-            "job_id": "job-1",
-            "model_id": "model-1",
-            "version_id": "version-1",
-            "tenant_id": "tenant-1",
-            "algorithm": {"algorithm_key": "xgboost"},
-        }
-    )
+    request_payload = _protocol_payload()
+    request_payload["resource_limits"] = {"max_training_time_seconds": 60}
+    payload = json.dumps(request_payload)
     redis = _FakeRedis(payload)
     submissions: list[tuple[str, dict[str, Any]]] = []
 
@@ -214,6 +255,15 @@ def test_existing_broker_runtime_submits_a_knova_driver(tmp_path: Path) -> None:
         base64.urlsafe_b64decode(encoded).decode("utf-8")
     )
     assert driver_input.operation_payload["knova_request"]["job_id"] == "job-1"
+    assert driver_input.received_at_ms is not None
+    assert driver_input.deadline_at_ms == driver_input.received_at_ms + 60000
+    assert driver_input.cancel_key == "knova:training:cancel:job-1"
+    assert submissions[0][1]["metadata"]["tributo.received_at_ms"] == str(
+        driver_input.received_at_ms
+    )
+    assert submissions[0][1]["metadata"]["tributo.deadline_at_ms"] == str(
+        driver_input.deadline_at_ms
+    )
     assert submissions[0][1]["metadata"]["tributo.run_id"] == "job-1"
     assert submissions[0][1]["metadata"]["tributo.attempt_id"] == "attempt-1"
     assert redis.acked == [("knova:training:tasks", "knova-training", "1-0")]
@@ -314,7 +364,7 @@ def test_ray_failure_before_driver_emits_knova_terminal_event(tmp_path: Path) ->
 
     event = json.loads(redis.events[-1][1]["payload"])
     assert event["event_type"] == "FAILED"
-    assert event["error_code"] == "RAY_JOB_FAILED"
+    assert event["error_code"] == "TRAINING_FAILED"
     assert event["job_id"] == item.operation_id
     assert active.get(item.operation_id) is None
 
