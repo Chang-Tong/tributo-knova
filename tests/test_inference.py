@@ -1438,7 +1438,9 @@ def test_native_multiclass_without_label_mapping_uses_verified_class_count(
     req = InferenceExecutionRequest.model_validate(payload)
     core, sink, _ = inference._build_request(req)
     core = inference._prepare_model(core, sink, req)
-    assert core.model.options["output_fields"][-1]["shape"] == ["batch", 3]
+    assert core.model.kind == "bundle"
+    manifest = json.loads((Path(core.model.uri) / "manifest.json").read_text())
+    assert manifest["output_signature"]["output_fields"][-1]["shape"] == ["batch", 3]
 
 
 @pytest.mark.parametrize(
@@ -1578,8 +1580,8 @@ def test_native_artifact_uses_verified_schema_sidecar_when_booster_omits_names(
     )
     req = InferenceExecutionRequest.model_validate(payload)
     core, sink, _ = inference._build_request(req)
-    core = inference._prepare_model(core, sink, req)
-    assert core.input_binding.tensors[0].columns == ("active_days", "spend")
+    prepared = inference._prepare_model(core, sink, req)
+    assert prepared.input_binding.tensors[0].columns == ("active_days", "spend")
     (folder / "feature_names.json").write_text('["changed","names"]')
     with pytest.raises(inference._InferenceConfigurationError) as error:
         inference._prepare_model(core, sink, req)
